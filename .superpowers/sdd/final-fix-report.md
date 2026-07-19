@@ -288,3 +288,107 @@ round 2)"
 - core(src/core/*)無変更確認: `git diff --stat f5024dc..HEAD -- src/core` は空(直前コミットからの差分ゼロ)。
   `git diff --stat 7865aaa..HEAD -- src/core` は 7865aaa(docs専用ベースライン)以降に追加された core ファイル群の
   総追加行のみを示し、削除/変更行は無い(= 実装コミット群を通じて core は一貫して無改造)。
+
+
+## Final review round 4 (P1/P2 残り2件)
+
+- コミット: 342c394 fix: clear stale lease-only nonterminals on history clear; abort offscreen accumulation on zip chunk failure (final review round 4)
+
+### P1 — ledger.ts applyClearTerminal: 履歴クリアで復旧できない stale nonterminal
+
+`applyClearTerminal` は従来 pending/requested を無条件に残していた(spec §7c-3: 進行中の
+browser DL を孤児化しないため)。しかし `downloadId === undefined` の nonterminal は
+browser 側にまだ download() が成功/永続化されていない lease-only の残骸であり、fail-closed
+復旧(「履歴を全部クリア」)がこの stale レコードに阻まれて `applyEnqueue` のブロックを
+解消できないケースがあった。
+
+TDD で `tests/ledger-lifecycle.test.ts` に失敗テストを追加(downloadId 無しの pending は
+削除される / downloadId 有りの requested は残る)、RED 確認後、`applyClearTerminal` に
+「downloadId undefined の nonterminal も削除(gen>0 は tombstone)、downloadId を持つ
+nonterminal は従来どおり保持」の分岐を追加して GREEN にした。
+
+**codex native レビューで追加指摘(1件)**: `download()` はキューの外(spec §7c-2 デッド
+ロック防止)、つまり enqueue のコミットと `applyDownloadStarted` のコミットの間に非同期の
+空白期間がある。この実装では、その空白期間中(download() 呼び出しがまだ解決していない
+だけ)に履歴クリアが走ると、`downloadId === undefined` というだけで生きた DL のレコードを
+削除してしまい、後から届く `applyDownloadStarted` は CAS で no-op になって downloadId が
+永続化されず、DL が孤児化(再クリックで同一ファイルの二重 DL)し得るという回帰。
+
+これに対し、`applyClearTerminal` に `now: number` 引数を追加し、`leasedAt` から 10 秒
+(既存の `settle.ts` の bounded-wait と同じ目安)の猶予期間を設け、「猶予期間内の
+downloadId 無し nonterminal は残す(競合窓の保護)」「猶予期間を過ぎてもなお downloadId が
+付かない場合のみ stale とみなして削除する」よう修正。`service-worker.ts` の呼び出し側は
+`applyClearTerminal(l, Date.now())` に更新。
+
+テスト追加(`tests/ledger-lifecycle.test.ts`):
+- 猶予期間(10s)を過ぎても downloadId 無しの pending は削除される(gen 0 は tombstone
+  化しない/ gen>0 は tombstone 化される、の 2 パターン)
+- 猶予期間内は downloadId 無しの pending でも削除しない(codex 指摘の競合窓保護)
+- downloadId 有りの requested は猶予期間経過後も削除されない
+- downloadId 付きの進行中(image:b)は terminal 削除・tombstone 化と混在しても残る
+
+### P2 — zip.ts downloadZipViaOffscreen: zip チャンク送信失敗時の offscreen リーク
+
+チャンク送信ループ(`sendChunkToOffscreen`)が `zipDone` 前に reject すると、offscreen
+document の `accumulators`(jobId ごとの Uint8Array 蓄積、常駐ページなので破棄されない
+限り残り続ける)にチャンクが居座ってリークする問題があった。
+
+修正: チャンク送信ループ〜`finishZipDownload` を try で囲み、途中で失敗したら offscreen へ
+`zipAbort(jobId)` を送って蓄積を破棄してから `{ ok: false, error }` を返すようにした。
+`zipAbort` メッセージ自体・offscreen 側の `zipAbort` ハンドラ(`accumulators.delete`)は
+既に存在していた(fantia-dl 由来)ため、新規に必要だったのは送信側(service worker)からの
+呼び出し配線のみ。
+
+テスト容易化のため `ZipOffscreenDeps`(`ensureOffscreen`/`sendChunk`/`finish`/`abort`)を
+`downloadZipViaOffscreen` の第3引数として注入可能にし(省略時は実 chrome API を使う既定
+実装)、`tests/zip.test.ts` に以下をユニットテストとして追加(offscreen 実体は使わず、
+deps を差し替えて検証):
+- チャンク送信が zipDone 前に失敗 → zipAbort が送られ、finish には到達しない
+- finish(zipDone)自体が失敗 → zipAbort が送られる
+- 正常系 → zipAbort は送られない
+
+手動確認は不要だった(deps 注入で完全にユニットテスト可能だったため)。
+
+### 完了確認
+
+```
+$ bun run test
+ Test Files  20 passed (20)
+      Tests  187 passed (187)
+
+$ bun run typecheck
+$ tsc --noEmit
+(0 errors)
+
+$ bun run build
+$ bun scripts/build.mjs
+  dist/content/content-script.js  5.3kb
+  dist/background/service-worker.js  74.2kb
+  dist/options/options.js  12.9kb
+  dist/offscreen/offscreen.js  1.5kb
+build done
+```
+
+core(src/core/*)無変更確認: `git diff --stat 7865aaa..HEAD -- src/core` は追加のみ
+(insertions 323、deletions 0)で、7865aaa(docs専用ベースライン)以降 core は一貫して
+追加されただけで変更されていないことを確認した。
+
+### codex-review (native, `--uncommitted`) 反復
+
+1. 1回目: P1 指摘 1件(上記「competing race window」)— 修正。
+2. 2回目(再レビュー): clean — 「I did not identify any discrete regressions in the
+   modified code paths. The changes are covered by targeted tests, and the updated
+   behavior appears internally consistent with the surrounding download and cleanup
+   logic.」
+
+### 懸念事項
+
+- 猶予期間(10s)は `settle.ts` の既存 bounded-wait と同じ目安値を流用した経験則であり、
+  極端に遅い `chrome.downloads.download()`(端末・拡張機の負荷等)ではこの窓を超える
+  可能性は理論上ゼロではない。ただし当該経路は元々 SW クラッシュ等からの手動復旧
+  (履歴クリア)を想定したものであり、ユーザーが数秒〜分オーダーで気づいて操作する
+  現実的なタイムスケールに対しては十分な安全マージンと判断した。
+- P2 の offscreen リーク修正は deps 注入によるユニットテストで検証したが、実際の
+  Chrome offscreen document / `chrome.runtime.sendMessage` を使った統合的な手動確認は
+  行っていない(依頼文の「offscreen 実体はテスト困難なので…難しければ手動確認で可」の
+  代替として deps 注入テストを選択したため)。
