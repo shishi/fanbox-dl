@@ -151,3 +151,108 @@ build done
 - `tests/orchestrator.test.ts`
 - `tests/settle.test.ts`
 - `tests/options-validate-templates.test.ts` (new)
+
+
+## Whole-branch review round 2 — 3 fail-closed gaps (this session)
+
+A subsequent whole-branch codex native review (round 2 of the whole-branch
+gate, distinct from the per-commit rounds above) found 3 more fail-closed
+gaps, all in the redirect/finalUrl-revalidation and interrupted-reason-
+preservation family:
+
+### Fix A (P1) — `orchestrator.ts` `finalizeComplete` fallback to `rec.url`
+
+`finalizeComplete` computed `finalUrl = item?.finalUrl || item?.url || rec.url`.
+When `chrome.downloads.search({ id })` races empty (e.g. history cleared
+concurrently), `item` is `undefined` and the code fell back to `rec.url` —
+the original, already-allowlisted request URL — so the allowlist check
+always passed and the job was marked `done` without ever confirming the
+real `finalUrl`. Fixed by dropping the `rec.url` fallback entirely: if
+`item?.finalUrl ?? item?.url` is unavailable, the job is not marked
+`done` — it goes to `error` via `applyDownloadInterrupted(..., "terminal_error",
+"完了を確認できませんでした(finalUrl 未確認)", ...)`, recoverable by the user
+re-clicking. This single fix, because `finalizeComplete` is the shared
+helper for all three completion call sites (`handleDownloadChanged`
+complete branch, crash-window adoption complete branch, and `requested`
+reconcile complete branch), closes the hole uniformly across all of them;
+the crash-window branch's separate ad-hoc "search empty" handling was
+removed in favor of routing through the same helper.
+
+Test added: `tests/orchestrator.test.ts` — "onChanged: complete だが
+search({id}) が空(履歴クリア等のレース)なら done にせず error にする
+(finalUrl 未確認) (最終レビュー修正2 Fix A)".
+
+### Fix B (P1) — `settle.ts` `settleInFlight` adopting `complete` without any finalUrl check
+
+When `settleInFlight` lost the in-flight promise and `findAdoptable` found
+a `complete` item, the code called `applyDownloadComplete` using only
+`hit.filename` — no `finalUrl` check against the allowlist at all (unlike
+the reconcile path, which already had `finalizeComplete`). Fixed by
+re-fetching the full item via `deps.search({ id: hit.id })`, resolving
+`finalUrl = full?.finalUrl ?? full?.url`, and validating with
+`validateMediaUrl(finalUrl, rec.postId)` (imported from
+`../core/url-allowlist`) before marking `done`; on failure it goes to
+`error` via `applyDownloadInterrupted(..., "terminal_error", "ダウンロード
+が許可外 URL にリダイレクトされました", ...)`. `SettleDeps.search`'s return
+type was widened with an optional `finalUrl` field.
+
+Test added: `tests/settle.test.ts` — "promise 喪失 + adoption した complete
+の finalUrl が allowlist 外(redirect)なら done にせず error にする (最終
+レビュー修正2 Fix B)".
+
+**Round-2 finding on this same fix (codex re-review):** the first version
+of Fix B still fell back to `hit.url` (the original request URL, not a
+verified `finalUrl`) when the follow-up `search({ id: hit.id })` itself
+raced empty — reopening the exact same hole Fix A had just closed
+elsewhere. Fixed by removing the `hit.url` fallback too: if `full` (or its
+`finalUrl`/`url`) is unavailable, the job fails closed to `error`
+("完了を確認できませんでした(finalUrl 未確認)") instead of being adopted as
+`done`.
+
+Test added: `tests/settle.test.ts` — "promise 喪失 + adoption した complete
+の実体再取得(id 指定)が空(race)なら hit.url にフォールバックせず done に
+せず error にする (codex レビュー指摘 最終レビュー修正2 round2)".
+
+### Fix C (P2) — `orchestrator.ts` crash-window adopted-interrupted reason loss
+
+In the crash-window adoption branch, when the adopted `hit` was
+`interrupted` and the follow-up `search({ id: hit.id })` raced empty,
+`reason` was resolved as `d?.error ?? "interrupted"` — discarding
+`hit.error` (e.g. `SERVER_FORBIDDEN`) captured at adoption time, so the
+job lost the explicit "未加入の有料コンテンツの可能性" wording and its
+`refusedUrl` guard against auto-requeue. Fixed by resolving
+`reason = d?.error ?? hit.error ?? "interrupted"`, and adding an optional
+`error?: string` field to `DownloadItemLike` (`adoption.ts`) plus
+`error: d.error` in the `items.map(...)` that builds adoption candidates
+in both `orchestrator.ts` and `settle.ts`, so `hit.error` is actually
+populated from the original search result.
+
+Test added: `tests/orchestrator.test.ts` — "起動時 reconcile: crash-window
+adoption した interrupted の hit が error(SERVER_FORBIDDEN) を持つ場合、
+実体再取得(id 指定)が空でも reason を失わず refusedUrl が付く (最終レビュー
+修正2 Fix C)".
+
+### Verification
+
+- `bun run test`: all green (171 tests, 20 files after the round-2 addendum
+  test; 170/20 immediately after Fixes A/B/C).
+- `bun run typecheck`: 0 errors.
+- `bun run build`: succeeds (service-worker bundle grew slightly,
+  72.8kb → 73.1kb).
+- codex native review (uncommitted diff, round 2 of whole-branch gate):
+  first pass flagged the `hit.url` fallback gap in Fix B (P2); after
+  fixing it, second pass returned "I did not find a discrete, actionable
+  regression in the modified code paths, and the existing test suite
+  passes with these changes." — clean.
+
+### Files changed (this round)
+
+- `src/background/adoption.ts` (added `error?: string` to `DownloadItemLike`)
+- `src/background/orchestrator.ts`
+- `src/background/settle.ts`
+- `tests/orchestrator.test.ts`
+- `tests/settle.test.ts`
+
+Commit: `242915c` — "fix: uniform fail-closed finalUrl revalidation across
+all completion/adoption paths + preserve interrupted reason (final review
+round 2)"
