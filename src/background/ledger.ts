@@ -95,7 +95,7 @@ export function applyEnqueue(
     contentType: cand.contentType, relPath, url: cand.url, generation,
     state: "pending", leaseToken: opts.newLeaseToken(), leasedAt: opts.now,
     pendingPostUpdatedAt: opts.postUpdatedAt,
-    supersededUrl: prev?.url, supersededAt: prev ? opts.now : undefined,
+    supersededUrl: prev?.url, supersededAt: prev?.doneAt,
     lastDownloadedPostUpdatedAt: prev?.lastDownloadedPostUpdatedAt,
     lastWarnedPostUpdatedAt: prev?.lastWarnedPostUpdatedAt,
     refetch: cand.refetch,

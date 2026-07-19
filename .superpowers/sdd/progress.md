@@ -3,3 +3,6 @@ Task 2: complete (gate v2 PASS status=200; canonical=content-script isolated-wor
 Task 3: complete (commit 0965289, review clean, 33 tests)
 Task 4: complete (commit b4ccbbb, review clean, 44 tests)
 Task 5: complete (commit 9d0ae2c, 50 tests, controller-inspected 逐語一致)
+Task 6: complete (commit df5514a, 57 tests, controller-inspected)
+Task 7: complete (commit a5bf7a3, 70 tests, controller-inspected)
+Task 8: complete (commit b81efeb, 73 tests, controller-inspected)
