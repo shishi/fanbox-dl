@@ -148,7 +148,7 @@ context の組み立て(background)で以下のようにマッピングする。
 |---|---|
 | image | 1 つの ContentBlock(contentType: "photo")に `images[]` を順に格納 |
 | file | 1 つの ContentBlock。各 file は拡張子で判定(VIDEO_EXT 流用): video / file |
-| article | blocks を出現順に走査。連続する同種(image 群 / file 群)は type 別 ContentBlock に集約し、出現順で seq を振る。**同一 post 内で同じ imageId / fileId が複数回出現した場合は初出のみ採用**(後続出現はスキップ。同一実体の重複 DL と `idemKey = postId:stableContentId` の衝突による job 上書き消失を防ぐ)。`$seq` / `$total` はスキップ後のユニークなファイル列に対して振る |
+| article | blocks を出現順に走査。連続する同種(image 群 / file 群)は type 別 ContentBlock に集約し、出現順で seq を振る。**「連続」の判定はメディアブロック(image/file)だけを見て行い、p 等の非メディアブロックはグループを切らない**(画像と本文が交互に並ぶ典型 article でギャラリーが単発に分解され、zip(§7b)が成立しなくなるため)。**同一 post 内で同じ imageId / fileId が複数回出現した場合は初出のみ採用**(後続出現はスキップ。同一実体の重複 DL と `idemKey = postId:stableContentId` の衝突による job 上書き消失を防ぐ)。`$seq` / `$total` はスキップ後のユニークなファイル列に対して振る |
 | text / video / 未知 | files 空 → DL 対象なし |
 
 - `isRestricted: true` または `body: null` は空の PostData(contents: [])を返し、
@@ -181,12 +181,20 @@ context の組み立て(background)で以下のようにマッピングする。
   - `USER_*`(ユーザーキャンセル)/ `FILE_*`(ディスク満杯・パス不正等のローカル要因)は
     **terminal `error`**(投稿ページを開いても直らないため needs_page にしない)
   - `NETWORK_*`(一時的な回線断)は保存 URL の**有界リトライ(1 回)** → 再失敗で terminal `error`
-  - `SERVER_*`(403/404 等 = URL 失効・編集の可能性)のみ `needs_page` に遷移
+  - `SERVER_FORBIDDEN`(403)は **terminal `error`(明示メッセージ「サーバがダウンロードを
+    拒否しました(未加入の有料コンテンツの可能性)」)**。§7a の「有料 403 は明示エラー」を
+    初回失敗の時点で満たすため needs_page にしない(編集由来で 403 が返る稀なケースでも、
+    次クリックの enqueue は URL が変わっていれば error レコードを再投入するため回復性は保たれる)
+  - その他の `SERVER_*`(404 等 = URL 失効・編集の可能性)のみ `needs_page` に遷移
   分類器は純粋関数として実装し単体テストを必須とする。`needs_page` のジョブは、
   次にその投稿ページでボタンを押したとき post.info を再取得して回復する。回復時のファイル特定は
   **`stableContentId` の一致のみで行い**、再取得後の投稿に該当 ID が無ければ
   「投稿が編集され該当ファイルは存在しない」と**明示エラーにする**(ordinal で別ファイルに
-  誤バインドする静かな失敗を禁止)。resume(SW 再起動時)は保存 URL の再投入を第一手とし、
+  誤バインドする静かな失敗を禁止)。該当 ID はあるが **URL が失敗時と同一**の場合も
+  再投入しない(編集由来の失効ではなく、再投入しても同じサーバ失敗を繰り返すだけの
+  クリックごと無限ループになるため)。この場合は「同じ URL のままサーバ側の失敗が
+  続いています。時間を置いて再試行してください」という**中立の明示 terminal error** にする
+  (有料 403 の明示エラーは §6 の classifier(SERVER_FORBIDDEN → terminal)が担う)。resume(SW 再起動時)は保存 URL の再投入を第一手とし、
   失敗したら同じ `needs_page` 経路に合流する。
 
 ## 7. 保存ダイアログ抑制
@@ -272,8 +280,13 @@ Fanbox では `downloads.fanbox.cc` が CORS 全拒否のため**この経路は
     MVP1 で実測(§13-5 と同時に上限付近の投稿でピークメモリを確認)し、必要なら調整する。
     ストリーミング zip(fflate の streaming API)への置き換えは、実測で問題が出た場合の
     改善候補として記録に留める(現段階では fantia-dl とのコード共有を優先)。
-  - 途中失敗(SW suspend / offscreen 失敗 / fetch 失敗)は部分 zip を保存せず、
-    「zip は最初からやり直し。確実性が要るなら通常 DL を」という文言の明示エラーにする。
+  - 途中失敗は部分 zip を保存しない。明示エラー(冒頭のフォールバック+通知)の**配達経路は
+    失敗の検出時点で決まる**: クリック処理中に検出できる失敗(fetch 失敗・バジェット超過・
+    offscreen 失敗等)はその場で個別 DL フォールバック+「zip は最初からやり直し。確実性が
+    要るなら通常 DL を」を含む通知。**blob の `downloads.download` を発行した後**の失敗
+    (応答返却後で click 通知は物理的に不可能)は、Chrome のダウンロード UI 上の失敗表示+
+    console への同文言ログに拠り、blob URL は revoke してリークさせない(one-shot 契約の
+    境界として README に明記)。
   - options / README に「zip は再開不可の一括処理。大きい投稿は通常 DL 推奨」と明記する。
   失敗の回復可能性が要るユースケースは通常 DL(§7a、ジョブ永続化あり)が正であり、
   zip はあくまで携帯性のための補助機能という役割分担を仕様として固定する。
@@ -488,7 +501,7 @@ DL 履歴の dedup キーは `idemKey = postId:stableContentId`(安定 ID ベー
   "permissions": ["downloads", "storage", "offscreen"],
   "host_permissions": ["https://*.fanbox.cc/*"],
   "content_scripts": [{
-    "matches": ["https://*.fanbox.cc/posts/*", "https://www.fanbox.cc/@*/posts/*"],
+    "matches": ["https://*.fanbox.cc/*"],
     "js": ["content/content-script.js"],
     "run_at": "document_idle"
   }],
@@ -500,13 +513,17 @@ DL 履歴の dedup キーは `idemKey = postId:stableContentId`(安定 ID ベー
 - postId 抽出: pathname `/posts/{id}`(両 URL 形式共通)。creatorId はサブドメインまたは `/@{slug}`。
 - Fanbox は SPA のため、`www.fanbox.cc` 内遷移で URL が変わってもページリロードが起きない。
   content script は History API 遷移を検知(`popstate` + 定期 URL チェック)してボタンを再注入する。
+  このため content script の matches は投稿 URL に絞らず **`https://*.fanbox.cc/*` 全域に常駐**させる
+  (クリエイタートップで初期ロードされた SPA から投稿へ遷移するケースで、投稿 URL 限定の
+  matches だと script 自体が存在せず §13-4 が構造的に通らないため)。ボタンの表示/非表示は
+  script 内の URL 判定が行う。
   (fantia-dl は静的遷移前提だったため、ここは Fanbox 固有の追加要件)
 
 ## 13. MVP マイルストーン1で実施する確認(hard gate)
 
 1. **(hard gate)** image / file 各 1 件で「直 URL → `downloads.download` 実保存」を実証。
    `saveAs: false` でダイアログ無し保存(Chrome 設定 OFF 時)も確認。
-2. **(hard gate・§7a)** 有料投稿(加入後)で cookie 依存性を実証。403 ならフォールバック実装に切替。
+2. **(hard gate・§7a)** 有料投稿(加入後)で cookie 依存性を実証。403 なら明示エラーになることを確認し、§7a に従い一級市民フォールバックの**別 spec 化を起こす**(即時実装はしない)。
 3. (削除)— canonical は background fetch(§4a)に一本化したため、
    isolated world / MAIN world の切替ゲートは無い。
 4. SPA 内遷移(クリエイターページ → 投稿ページ)でボタン注入が働くか。
