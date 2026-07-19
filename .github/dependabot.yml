@@ -1,0 +1,8 @@
+# Version updates are handled by Renovate (see .github/renovate.json).
+# This file explicitly declares no Dependabot version updates so the
+# GitHub-managed "Dependabot Updates" workflow doesn't try to update
+# bun.lock (which Dependabot doesn't fully support) and fail.
+# Security alerts / automated security fixes are configured separately
+# at the account level and remain enabled independently of this file.
+version: 2
+updates: []

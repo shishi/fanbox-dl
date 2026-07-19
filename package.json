@@ -1,0 +1,21 @@
+{
+  "name": "fanbox-dl",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "bun scripts/build.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.2.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^7.0.0",
+    "vitest": "^4.0.0"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3"
+  }
+}
