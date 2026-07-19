@@ -165,4 +165,45 @@ describe("orchestrator (SW 層の spec 契約)", () => {
     const rec = (await store.read()).jobs["1:image:a"];
     expect(rec.state).toBe("error"); // 検証できないまま done にしない(fail-closed)
   });
+
+  it("onChanged: complete だが search({id}) が空(履歴クリア等のレース)なら done にせず error にする(finalUrl 未確認) (最終レビュー修正2 Fix A)", async () => {
+    const { deps, store } = mkDeps({ zip: { eligible: () => false, collect: async () => ({ ok: false, error: "x" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) } });
+    const o = createOrchestrator(deps);
+    await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a")]) });
+    const rec = Object.values((await store.read()).jobs)[0];
+    // rec.url にフォールバックすると常に allowlist を通ってしまい「確認できていないのに done」に
+    // なる — item(finalUrl の出所)が取れない以上、done にせず fail-closed で error 化する。
+    deps.downloads.search = async () => [];
+    await o.handleDownloadChanged({ id: rec.downloadId!, state: { current: "complete", previous: "in_progress" } } as any);
+    const after = (await store.read()).jobs[rec.idemKey];
+    expect(after.state).toBe("error"); // done にしない
+    expect(after.error).toContain("finalUrl");
+  });
+
+  it("起動時 reconcile: crash-window adoption した interrupted の hit が error(SERVER_FORBIDDEN) を持つ場合、実体再取得(id 指定)が空でも reason を失わず refusedUrl が付く (最終レビュー修正2 Fix C)", async () => {
+    const { deps, store } = mkDeps();
+    const url = "https://downloads.fanbox.cc/images/post/1/a.jpeg";
+    const relPath = "fanbox/s/T/a.jpeg";
+    await store.commit((l) => {
+      const r = applyEnqueue(l, [{
+        idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+        url, basePath: relPath,
+        refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+      }], { force: false, postUpdatedAt: "x", now: 1000, newLeaseToken: () => "L1", validatePath: () => null });
+      return { ledger: r.ledger, result: null };
+    });
+    // adoption 検索(url 指定)ではヒットが SERVER_FORBIDDEN の error を持つ interrupted を返し、
+    // 後段の実体再取得(id 指定)は history clear 等のレースで空を返す。
+    deps.downloads.search = async (q: any) => {
+      if (q?.id === 55) return [];
+      return [{ id: 55, url, filename: `/dl/${relPath}`, startTime: new Date(2000).toISOString(), state: "interrupted", error: "SERVER_FORBIDDEN" } as any];
+    };
+    const o = createOrchestrator(deps);
+    await o.runStartupReconcile();
+    const rec = (await store.read()).jobs["1:image:a"];
+    expect(rec.state).toBe("error");
+    // reason が "interrupted" に丸められて SERVER_FORBIDDEN を喪失していないこと
+    expect(rec.error).toContain("未加入の有料コンテンツの可能性");
+    expect(rec.refusedUrl).toBe(url);
+  });
 });

@@ -1,12 +1,13 @@
 import { findAdoptable } from "./adoption";
 import { applyDownloadStarted, applyDownloadComplete, applyDownloadInterrupted, applyDownloadRequestFailed } from "./ledger";
 import { classifyDownloadError } from "./failure-classifier";
+import { validateMediaUrl } from "../core/url-allowlist";
 import type { JobStore } from "./job-store";
 
 export interface SettleDeps {
   store: JobStore;
   inFlight: Map<string, Promise<void>>; // leaseToken -> 進行中の download() 呼び出し
-  search: (q: { url?: string; id?: number }) => Promise<Array<{ id: number; url?: string; filename: string; startTime?: string; state?: string; error?: string }>>;
+  search: (q: { url?: string; id?: number }) => Promise<Array<{ id: number; url?: string; finalUrl?: string; filename: string; startTime?: string; state?: string; error?: string }>>;
   cancel: (id: number) => Promise<void>;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -39,12 +40,31 @@ export async function settleInFlight(postId: string, deps: SettleDeps): Promise<
         // (b) promise 喪失: adoption 述語で browser 側の実体を探す
         const items = await deps.search({ url: rec.url });
         const hit = findAdoptable(
-          items.map((d) => ({ id: d.id, url: d.url ?? "", filename: d.filename, startTime: d.startTime ?? "", state: d.state })),
+          items.map((d) => ({ id: d.id, url: d.url ?? "", filename: d.filename, startTime: d.startTime ?? "", state: d.state, error: d.error })),
           { url: rec.url, relPath: rec.relPath, leasedAt: rec.leasedAt ?? 0 },
         );
         if (hit && hit.state === "complete") {
+          // 最終レビュー修正2 Fix B: adoption 述語は URL/パス/時刻だけで採用するため、
+          // redirect 済みかどうかは未確認。採用前に hit.id で実体を再取得し、finalUrl を
+          // allowlist で再検証してから done 化する(reconcile の finalizeComplete と同じ契約)。
+          const [full] = await deps.search({ id: hit.id });
+          // codex レビュー指摘(最終レビュー修正2 round2): 実体再取得(id 指定)が history
+          // clear 等のレースで空を返す場合、hit.url(検証済みの元 request URL であって
+          // 「検証済み finalUrl」ではない)へフォールバックすると、finalizeComplete が
+          // 閉じたのと同じ redirect bypass の穴を settle 側で再び開けてしまう。
+          // fail-closed: full(または full.finalUrl/full.url)が無ければ done にしない。
+          const finalUrl = full?.finalUrl ?? full?.url;
+          const v = finalUrl ? validateMediaUrl(finalUrl, rec.postId) : { ok: false as const, error: "実体を再取得できません" };
+          if (!v.ok) {
+            const message = finalUrl ? "ダウンロードが許可外 URL にリダイレクトされました" : "完了を確認できませんでした(finalUrl 未確認)";
+            await deps.store.commit((l) => ({
+              ledger: applyDownloadInterrupted(applyDownloadStarted(l, rec.idemKey, token, hit.id), rec.idemKey, token, "terminal_error", message, newLeaseToken, deps.now()),
+              result: null,
+            }));
+            continue;
+          }
           // terminal は採用してから進む(成果を捨てない)
-          await deps.store.commit((l) => ({ ledger: applyDownloadComplete(applyDownloadStarted(l, rec.idemKey, token, hit.id), rec.idemKey, token, hit.filename, deps.now()), result: null }));
+          await deps.store.commit((l) => ({ ledger: applyDownloadComplete(applyDownloadStarted(l, rec.idemKey, token, hit.id), rec.idemKey, token, full?.filename ?? hit.filename, deps.now()), result: null }));
           continue;
         }
         if (hit && hit.state === "interrupted") {

@@ -6,6 +6,9 @@ export interface DownloadItemLike {
   filename: string;   // chrome.downloads は絶対パスを返す
   startTime: string;  // ISO 8601
   state?: string;
+  // 最終レビュー修正2 Fix C: 採用元(1回目 search)が既に持つ interrupted reason
+  // (SERVER_FORBIDDEN 等)を、後段の id 指定 re-fetch が race で空を返しても失わないため保持する。
+  error?: string;
 }
 
 export function pathMatchesBoundary(absFilename: string, relPath: string): boolean {

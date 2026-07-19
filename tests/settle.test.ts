@@ -145,4 +145,42 @@ describe("settleInFlight (spec §7c-3 lease 窓中の force)", () => {
     const l = await store.read();
     expect(l.jobs["111:image:a"].refusedUrl).toBeUndefined();
   });
+
+  it("promise 喪失 + adoption した complete の finalUrl が allowlist 外(redirect)なら done にせず error にする (最終レビュー修正2 Fix B)", async () => {
+    const store = new JobStore(memStorage());
+    await seedPending(store);
+    const errors = await settleInFlight("111", {
+      store, inFlight: new Map(),
+      search: async (q: any) => {
+        // adoption 述語(url 指定)は URL/パス/時刻だけで採用するため、redirect 済みかどうかは
+        // 未確認。採用後の実体再取得(id 指定)で初めて finalUrl がわかる想定。
+        if (q?.id === 7) return [{ id: 7, finalUrl: "https://evil.example.com/a.jpeg", filename: "/dl/fanbox/s/T/a.jpeg", state: "complete" }];
+        return [{ id: 7, url: "https://downloads.fanbox.cc/images/post/111/a.jpeg", filename: "/dl/fanbox/s/T/a.jpeg", startTime: new Date(2000).toISOString(), state: "complete" }];
+      },
+      cancel: async () => {}, now: () => 5000, sleep: async () => {},
+    });
+    expect(errors).toEqual([]);
+    const l = await store.read();
+    expect(l.jobs["111:image:a"].state).toBe("error"); // hit.filename だけで done にしない
+    expect(l.jobs["111:image:a"].error).toContain("許可外");
+  });
+
+  it("promise 喪失 + adoption した complete の実体再取得(id 指定)が空(race)なら hit.url にフォールバックせず done にせず error にする (codex レビュー指摘 最終レビュー修正2 round2)", async () => {
+    const store = new JobStore(memStorage());
+    await seedPending(store);
+    const errors = await settleInFlight("111", {
+      store, inFlight: new Map(),
+      search: async (q: any) => {
+        // 採用後の実体再取得(id 指定)が history clear 等のレースで空を返す想定。
+        // hit.url(検証済みの元 request URL であって「検証済み finalUrl」ではない)へ
+        // フォールバックすると redirect bypass を再び許してしまう。
+        if (q?.id === 7) return [];
+        return [{ id: 7, url: "https://downloads.fanbox.cc/images/post/111/a.jpeg", filename: "/dl/fanbox/s/T/a.jpeg", startTime: new Date(2000).toISOString(), state: "complete" }];
+      },
+      cancel: async () => {}, now: () => 5000, sleep: async () => {},
+    });
+    expect(errors).toEqual([]);
+    const l = await store.read();
+    expect(l.jobs["111:image:a"].state).toBe("error"); // 検証できないまま done にしない(fail-closed)
+  });
 });

@@ -56,12 +56,18 @@ export function createOrchestrator(deps: OrchestratorDeps): {
   // spec §4a-3(緩和): complete 到達時は必ず最終 URL を allowlist で再検証する(redirect 対策)。
   // handleDownloadChanged の実 DL complete 経路と、runStartupReconcile の 2 つの complete
   // 経路(crash-window adoption / requested reconcile)は、どれも同じ純粋変換をここに集約する。
+  // 最終レビュー修正2 Fix A: item が undefined、または finalUrl を確定できない場合は
+  // rec.url へフォールバックしない(フォールバックすると常に allowlist を通ってしまい、
+  // 「確認できていないのに done」を許してしまう) — fail-closed で error 化する。
   function finalizeComplete(
     l: Ledger, rec: JobRecord, token: string,
     item: { finalUrl?: string; url?: string; filename?: string } | undefined,
     now: number,
   ): Ledger {
-    const finalUrl = item?.finalUrl || item?.url || rec.url;
+    const finalUrl = item?.finalUrl ?? item?.url;
+    if (!finalUrl) {
+      return applyDownloadInterrupted(l, rec.idemKey, token, "terminal_error", "完了を確認できませんでした(finalUrl 未確認)", newLeaseToken, now);
+    }
     if (!validateMediaUrl(finalUrl, rec.postId).ok) {
       return applyDownloadInterrupted(l, rec.idemKey, token, "terminal_error", "ダウンロードが許可外 URL にリダイレクトされました", newLeaseToken, now);
     }
@@ -270,7 +276,8 @@ export function createOrchestrator(deps: OrchestratorDeps): {
     if (cur === "complete") {
       // spec §7c-2: 実保存パスを取得して乖離を判定
       const [item] = await deps.downloads.search({ id: delta.id });
-      // spec §4a-3(緩和): 最終 URL が allowlist を抜けていたら done にせず error 化(redirect 対策)
+      // spec §4a-3(緩和): 最終 URL が allowlist を抜けていたら done にせず error 化(redirect 対策)。
+      // item が undefined(履歴クリア等のレース)の場合も finalizeComplete が fail-closed に倒す。
       await store.commit((l) => ({ ledger: finalizeComplete(l, rec, token, item, deps.now()), result: null }));
       return;
     }
@@ -302,7 +309,7 @@ export function createOrchestrator(deps: OrchestratorDeps): {
     for (const rec of findLeasesWithoutDownloadId(ledger)) {
       const items = await deps.downloads.search({ url: rec.url });
       const hit = findAdoptable(
-        items.map((d) => ({ id: d.id, url: d.url ?? "", filename: d.filename, startTime: d.startTime ?? "", state: d.state })),
+        items.map((d) => ({ id: d.id, url: d.url ?? "", filename: d.filename, startTime: d.startTime ?? "", state: d.state, error: d.error })),
         { url: rec.url, relPath: rec.relPath, leasedAt: rec.leasedAt ?? 0 },
       );
       if (hit) {
@@ -310,25 +317,19 @@ export function createOrchestrator(deps: OrchestratorDeps): {
         if (hit.state === "complete") {
           // spec §4a-3(緩和): ここも handleDownloadChanged と同じ finalUrl 再検証を通す
           // (採用述語は URL/パス/時刻だけで adopt するため、redirect 済みかどうかは未確認)。
+          // 最終レビュー修正2 Fix A: 実体再取得(id 指定)が空でも finalizeComplete 自体が
+          // fail-closed に倒すため、ここで特別扱いせず同じヘルパへ一様に通す
+          // (すべての完了経路で同一の再検証・同一のフォールバック文言にする)。
           const [d] = await deps.downloads.search({ id: hit.id });
-          if (d) {
-            await store.commit((l) => ({ ledger: finalizeComplete(l, rec, rec.leaseToken!, d, deps.now()), result: null }));
-          } else {
-            // 2 回目の search が history clear 等のレースで空を返す場合(codex レビュー指摘
-            // P3 round2): hit.url(常に allowlist 内 = 検証済み request URL)を finalUrl の
-            // 代わりに使うと、redirect bypass チェックをすり抜けさせてしまう
-            // (hit.url は「検証済み finalUrl」ではなく単なる元 URL)。fail-closed で
-            // error に倒し、done と誤認させない。
-            await store.commit((l) => ({
-              ledger: applyDownloadInterrupted(l, rec.idemKey, rec.leaseToken!, "terminal_error", "ダウンロード完了を確認できませんでした(実体を再取得できません)", newLeaseToken, deps.now()),
-              result: null,
-            }));
-          }
+          await store.commit((l) => ({ ledger: finalizeComplete(l, rec, rec.leaseToken!, d, deps.now()), result: null }));
         } else if (hit.state === "interrupted") {
           // 採用した実体が既に interrupted の場合、ここで分類まで済ませないと
           // 「requested のまま enqueue をブロックし続ける」wedge になる
           const [d] = await deps.downloads.search({ id: hit.id });
-          const reason = d?.error ?? "interrupted";
+          // 最終レビュー修正2 Fix C: 2 回目(id 指定)の search が history clear 等のレースで
+          // 空を返しても、採用元 hit(1 回目の url 指定 search)が保持する error
+          // (SERVER_FORBIDDEN 等)を "interrupted" に丸めて喪失させない。
+          const reason = d?.error ?? hit.error ?? "interrupted";
           const action = classifyDownloadError(reason === "interrupted" ? undefined : reason);
           const after = await store.commit((l) => {
             const l2 = applyDownloadInterrupted(l, rec.idemKey, rec.leaseToken!, action, reason, newLeaseToken, deps.now());
