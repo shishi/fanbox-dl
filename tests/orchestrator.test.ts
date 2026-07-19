@@ -229,4 +229,207 @@ describe("orchestrator (SW 層の spec 契約)", () => {
     expect(rec.relPath.split("/").length).toBe(expectedSegments); // 余計なサブフォルダが増えない
     expect(rec.relPath).not.toContain(":"); // 置換自体は行われている
   });
+
+  it("zip 予定ギャラリーに needs_page があっても回復は個別 DL を再開せず zip 1 本だけになる(二重発生防止) (最終レビュー round5 P2a)", async () => {
+    const { deps, downloaded, store } = mkDeps({
+      zip: {
+        eligible: () => true,
+        collect: async () => ({ ok: true, buffers: new Map([
+          ["1:image:a", new Uint8Array(1)],
+          ["1:image:b", new Uint8Array(1)],
+        ]) }),
+        build: () => ({ zipPath: "fanbox/s/T/T.zip", bytes: new Uint8Array(1) }),
+        downloadViaOffscreen: async () => ({ ok: true }),
+      },
+    });
+    // 過去に needs_page で止まっていた image:a のジョブを仕込む(今回の投稿には現存する)
+    await store.commit((l) => ({
+      ledger: {
+        ...l,
+        jobs: {
+          ...l.jobs,
+          "1:image:a": {
+            idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+            relPath: "fanbox/s/T/old-a.jpeg", url: "https://downloads.fanbox.cc/images/post/1/old-a.jpeg",
+            generation: 1, state: "needs_page",
+            refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+          } as any,
+        },
+      },
+      result: null,
+    }));
+    const o = createOrchestrator(deps);
+    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a"), img("b")]) });
+    expect(res.zipQueued).toBe(1);
+    expect(res.queued).toBe(0); // needs_page 回復から個別 DL が始まらない(zip との二重発生防止)
+    expect(downloaded).toHaveLength(0); // chrome.downloads.download() は一切呼ばれていない
+    const after = (await store.read()).jobs["1:image:a"];
+    expect(after.state).toBe("needs_page"); // 回復対象から除外され、missing/error にもならずそのまま
+  });
+
+  it("video を無効化した後は video の needs_page が回復再開されない (最終レビュー round5 P2b)", async () => {
+    const { deps, store } = mkDeps({
+      loadSettings: async () => ({ ...DEFAULT_SETTINGS, contentTypes: { ...DEFAULT_SETTINGS.contentTypes, video: false } }),
+      zip: { eligible: () => false, collect: async () => ({ ok: false, error: "x" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) },
+    });
+    const videoJson = { body: { post: {
+      id: "1", title: "T", feeRequired: 0, publishedDatetime: "2026-07-01T00:00:00+09:00",
+      updatedDatetime: "2026-07-02T00:00:00+09:00", isRestricted: false,
+      user: { userId: "9", name: "C" }, creatorId: "s", type: "file",
+      body: { text: "", files: [
+        { id: "v1", name: "clip", extension: "mp4", url: "https://downloads.fanbox.cc/files/post/1/v1.mp4" },
+      ] },
+    } } };
+    // 過去に needs_page で止まっていた動画ジョブを仕込む(旧 URL のまま)
+    await store.commit((l) => ({
+      ledger: {
+        ...l,
+        jobs: {
+          ...l.jobs,
+          "1:file:v1": {
+            idemKey: "1:file:v1", postId: "1", stableContentId: "file:v1", contentType: "video",
+            relPath: "fanbox/s/T/old-clip.mp4", url: "https://downloads.fanbox.cc/files/post/1/old-v1.mp4",
+            generation: 1, state: "needs_page",
+            refetch: { postId: "1", stableContentId: "file:v1", index: 0 },
+          } as any,
+        },
+      },
+      result: null,
+    }));
+    const o = createOrchestrator(deps);
+    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: videoJson });
+    expect(res.queued).toBe(0);
+    const after = (await store.read()).jobs["1:file:v1"];
+    expect(after.state).toBe("needs_page"); // 無効化した contentType の旧ジョブを勝手に再開しない
+  });
+
+
+  it("zip 予定だが実際には zip 化に失敗して個別 DL にフォールバックする場合、changed-URL の needs_page は generation を上げて正しく回復する (codex レビュー round5 P2a フォローアップ)", async () => {
+    // mkDeps() の既定 zip mock は eligible:()=>true / collect が失敗するため、
+    // このブロックは「zip 予定だったが実際には個別 DL にフォールバックする」を再現する。
+    const { deps, downloaded, store } = mkDeps();
+    await store.commit((l) => ({
+      ledger: {
+        ...l,
+        jobs: {
+          ...l.jobs,
+          "1:image:a": {
+            idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+            relPath: "fanbox/s/T/old-a.jpeg", url: "https://downloads.fanbox.cc/images/post/1/old-a.jpeg",
+            generation: 0, state: "needs_page",
+            refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+          } as any,
+        },
+      },
+      result: null,
+    }));
+    const o = createOrchestrator(deps);
+    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a"), img("b")]) });
+    expect(res.zipQueued).toBe(0);
+    expect(res.queued).toBe(2); // 個別フォールバックで image:a, image:b とも enqueue
+    const after = (await store.read()).jobs["1:image:a"];
+    expect(after.state).toBe("requested");
+    expect(after.relPath).toContain(".rev1."); // 世代交代の canonical パス規則が正しく効いている
+    expect(downloaded.length).toBe(2);
+  });
+
+  it("zip 予定だが実際には zip 化に失敗して個別 DL にフォールバックする場合、same-URL の needs_page は再試行されず明示 error になる (codex レビュー round5 P2a フォローアップ)", async () => {
+    const { deps, downloaded, store } = mkDeps();
+    const url = img("a").originalUrl; // 投稿側と同じ URL のまま(編集による失効ではない)
+    await store.commit((l) => ({
+      ledger: {
+        ...l,
+        jobs: {
+          ...l.jobs,
+          "1:image:a": {
+            idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+            relPath: "fanbox/s/T/a.jpeg", url,
+            generation: 0, state: "needs_page",
+            refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+          } as any,
+        },
+      },
+      result: null,
+    }));
+    const o = createOrchestrator(deps);
+    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a"), img("b")]) });
+    const after = (await store.read()).jobs["1:image:a"];
+    expect(after.state).toBe("error"); // 同じ URL のままの回復要求はサーバ拒否として明示 error
+    expect(res.errors.some((e) => e.includes("同じ URL のままサーバ側の失敗が続いています"))).toBe(true);
+    expect(downloaded).not.toContain(url); // 再試行されていない
+    expect(downloaded).toContain(img("b").originalUrl); // image:b は通常通り enqueue される
+  });
+
+
+  it("複数ブロックの投稿で、あるブロックの zip フォールバック回復が他ブロックの据え置き needs_page を誤って missing 化しない (codex レビュー round5 P1 フォローアップ)", async () => {
+    const articleJson = { body: { post: {
+      id: "1", title: "T", feeRequired: 0, publishedDatetime: "2026-07-01T00:00:00+09:00",
+      updatedDatetime: "2026-07-02T00:00:00+09:00", isRestricted: false,
+      user: { userId: "9", name: "C" }, creatorId: "s", type: "article",
+      body: {
+        blocks: [
+          { type: "image", imageId: "i1" },
+          { type: "image", imageId: "i2" },
+          { type: "file", fileId: "f1" },
+          { type: "image", imageId: "i4" },
+          { type: "image", imageId: "i5" },
+        ],
+        imageMap: {
+          i1: { id: "i1", extension: "jpeg", originalUrl: "https://downloads.fanbox.cc/images/post/1/i1.jpeg" },
+          i2: { id: "i2", extension: "jpeg", originalUrl: "https://downloads.fanbox.cc/images/post/1/i2.jpeg" },
+          i4: { id: "i4", extension: "jpeg", originalUrl: "https://downloads.fanbox.cc/images/post/1/i4.jpeg" },
+          i5: { id: "i5", extension: "jpeg", originalUrl: "https://downloads.fanbox.cc/images/post/1/i5.jpeg" },
+        },
+        fileMap: {
+          f1: { id: "f1", name: "doc", extension: "pdf", url: "https://downloads.fanbox.cc/files/post/1/f1.pdf" },
+        },
+        embedMap: {}, urlEmbedMap: {},
+      },
+    } } };
+    // block1(i1,i2)は zip 成功、block3(i4,i5)は zip 失敗してフォールバックする状況を再現する
+    const { deps, store } = mkDeps({
+      zip: {
+        eligible: (b: any) => b.contentType === "photo" && b.files.length >= 2,
+        collect: async (files: any) => {
+          if (files.some((f: any) => f.idemKey.includes("image:i1") || f.idemKey.includes("image:i2"))) {
+            return { ok: true, buffers: new Map(files.map((f: any) => [f.idemKey, new Uint8Array(1)])) };
+          }
+          return { ok: false, error: "zip 失敗(テスト・block3)" };
+        },
+        build: (post: any, b: any) => ({ zipPath: `fanbox/s/T/block${b.blockOrdinal}.zip`, bytes: new Uint8Array(1) }),
+        downloadViaOffscreen: async () => ({ ok: true }),
+      },
+    });
+    await store.commit((l) => ({
+      ledger: {
+        ...l,
+        jobs: {
+          ...l.jobs,
+          "1:image:i1": {
+            idemKey: "1:image:i1", postId: "1", stableContentId: "image:i1", contentType: "photo",
+            relPath: "fanbox/s/T/old-i1.jpeg", url: "https://downloads.fanbox.cc/images/post/1/old-i1.jpeg",
+            generation: 0, state: "needs_page",
+            refetch: { postId: "1", stableContentId: "image:i1", index: 0 },
+          } as any,
+          "1:image:i4": {
+            idemKey: "1:image:i4", postId: "1", stableContentId: "image:i4", contentType: "photo",
+            relPath: "fanbox/s/T/old-i4.jpeg", url: "https://downloads.fanbox.cc/images/post/1/old-i4.jpeg",
+            generation: 0, state: "needs_page",
+            refetch: { postId: "1", stableContentId: "image:i4", index: 0 },
+          } as any,
+        },
+      },
+      result: null,
+    }));
+    const o = createOrchestrator(deps);
+    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: articleJson });
+    const jobs = (await store.read()).jobs;
+    // block1(i1,i2)は zip 成功 -> i1 の据え置き needs_page は他ブロック処理の巻き添えで
+    // missing/error 化されず、needs_page のまま残る
+    expect(jobs["1:image:i1"].state).toBe("needs_page");
+    // block3(i4,i5)は zip 失敗 -> フォールバックで i4 は正しく世代交代して回復する
+    expect(jobs["1:image:i4"].state).toBe("requested");
+    expect(jobs["1:image:i4"].relPath).toContain(".rev1.");
+    expect(res.zipQueued).toBe(1); // block1 のみ zip 成功
+  });
 });

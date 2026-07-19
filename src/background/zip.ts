@@ -3,6 +3,7 @@ import { bytesToBase64 } from "../core/base64";
 import { renderTemplate } from "../core/template-engine";
 import { validateMediaUrl } from "../core/url-allowlist";
 import { CONFLICT_ACTION } from "../core/settings";
+import { validatePath } from "../core/path-validator";
 import { buildRenderContext, buildZipRenderContext } from "./render-adapter";
 import { OFFSCREEN_TARGET } from "../offscreen/protocol";
 import type { OffscreenAbortMessage, OffscreenChunkMessage, OffscreenDoneMessage, OffscreenRevokeMessage, OffscreenResult } from "../offscreen/protocol";
@@ -111,6 +112,17 @@ export function buildZip(
       while (usedNames.has(candidate)) { n++; candidate = `${stem} (${n})${ext}`; }
       entryPath = candidate;
     }
+    // 最終レビュー round5 P2c: zipPath は呼び出し側(orchestrator)で download 前に
+    // validatePath されるが、各 entryPath はここまで無検証で archive に書かれていた。
+    // 古い同期設定等で zipEntryTemplate 自体に不正なパス片が残っていた場合に備え、
+    // zipPath と同じ検証を entryPath にも適用し、fail-closed で throw する
+    // (呼び出し側の個別 DL フォールバックに乗せるため、ここで握りつぶさない)。
+    // codex レビュー round5 指摘: zip 内部のエントリ名は chrome.downloads の
+    // uniquify サフィックス付与対象ではない(実ファイルシステムパスではない)ため、
+    // conflictAction:"uniquify" 前提の uniquifyHeadroom をここで引いてはいけない
+    // (引くと実際には収まる長さの entry まで誤って拒否してしまう)。
+    const pv = validatePath(entryPath, { fullPathMaxLen: s.fullPathMaxLen, uniquifyHeadroom: s.uniquifyHeadroom, conflictAction: "overwrite", segmentMaxLen: s.segmentMaxLen });
+    if (!pv.ok) throw new Error(`zip entryPath 不正: ${entryPath}: ${pv.error}`);
     usedNames.add(entryPath);
     entries[entryPath] = buf;
   }

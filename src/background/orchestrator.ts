@@ -193,15 +193,60 @@ export function createOrchestrator(deps: OrchestratorDeps): {
       for (const k of inv) res.errors.push(`${k}: メディア URL が許可外のためダウンロードできません`);
     }
 
-    // needs_page 回復(spec §6): この投稿の needs_page レコードを安定 ID で再バインド
-    const fresh = post.contents.flatMap((b) => b.files.map((f) => ({
-      stableContentId: f.stableContentId, url: f.url,
-      basePath: renderTemplate(s.pathTemplate, buildRenderContext(post, b, f, now), { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen }),
-    })));
+    // needs_page 回復(spec §6): この投稿の needs_page レコードを安定 ID で再バインド。
+    // 最終レビュー round5 P2a/P2b(codex 指摘): 回復対象は「現在の設定で実際に個別 DL
+    // される予定のファイル」に限定する。zip 予定ブロックのファイル(zip 側が扱うため
+    // 個別回復と二重発生させない)と、無効化された contentType のファイル(勝手な
+    // 再開を防ぐ)は fresh から除外する。ただし core(applyNeedsPageRecovery)は
+    // 「fresh に無い stableContentId = 投稿編集で消えた」と解釈して missing/error に
+    // 倒すため、除外分の既存 needs_page レコードは missing 化される前のスナップショットを
+    // 保持しておき、commit 後に据え置き(needs_page のまま)へ戻す(core 無改造)。
+    //
+    // codex レビュー round5 フォローアップ指摘: zip 予定(zipEligible)は静的な設定判定に
+    // すぎず、実行時に collect/build/downloadViaOffscreen が失敗して個別 DL に
+    // フォールバックすることがある。その場合、ここで据え置いた needs_page レコードを
+    // 後段の個別 candidates ループへそのまま流すと、core の適切な回復ロジック
+    // (同一 URL は拒否 / URL 変更は世代交代)を経ないまま applyEnqueue の
+    // 「非回復 needs_page 再クリック」分岐(同世代・無条件再投入)に落ちてしまい、
+    // 拒否済み URL の黙った再試行や、世代が上がらないままの再投入を招く。
+    // これを避けるため、zip 予定ブロックの isZipPlanned だけはブロックごとに
+    // 覚えておき、後段のブロックループで実際に zip が不成立だったブロックに限って
+    // その場で block スコープの回復(applyNeedsPageRecovery)をもう一度掛け直す。
+    const zipPlannedByBlock = new Map<typeof post.contents[number], boolean>();
+    const excludedStableIds = new Set<string>();
+    const fresh: Array<{ stableContentId: string; url: string; basePath: string }> = [];
+    for (const b of post.contents) {
+      const isZipPlanned = deps.zip.eligible(b, s);
+      zipPlannedByBlock.set(b, isZipPlanned);
+      for (const f of b.files) {
+        if (isZipPlanned || !(s.contentTypes as any)[f.contentType]) {
+          excludedStableIds.add(f.stableContentId);
+          continue;
+        }
+        fresh.push({
+          stableContentId: f.stableContentId, url: f.url,
+          basePath: renderTemplate(s.pathTemplate, buildRenderContext(post, b, f, now), { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen }),
+        });
+      }
+    }
     try {
       const rec = await store.commit((l) => {
+        // 除外対象 stableContentId を持つ既存 needs_page レコードは、core が missing 化する
+        // 前の状態をここでスナップショットしておく(復元用)。
+        const toRestore = Object.values(l.jobs).filter(
+          (j) => j.postId === post.postId && j.state === "needs_page" && excludedStableIds.has(j.stableContentId),
+        );
         const r = applyNeedsPageRecovery(l, post.postId, fresh, { now: deps.now(), postUpdatedAt: post.updatedAtIso, newLeaseToken, validatePath: vp, invalidIds });
-        return { ledger: r.ledger, result: r };
+        let ledger = r.ledger;
+        let missing = r.missing;
+        if (toRestore.length > 0) {
+          const restoreKeys = new Set(toRestore.map((j) => j.idemKey));
+          const jobs = { ...ledger.jobs };
+          for (const orig of toRestore) jobs[orig.idemKey] = orig; // missing 化を取り消し、needs_page に据え置く
+          ledger = { ...ledger, jobs };
+          missing = missing.filter((k) => !restoreKeys.has(k));
+        }
+        return { ledger, result: { ...r, missing } };
       });
       for (const j of rec.toStart) { pending.push(startDownload(j)); res.queued++; }
       for (const k of rec.missing) res.errors.push(`${k}: 投稿が編集され該当ファイルは存在しません`);
@@ -217,7 +262,8 @@ export function createOrchestrator(deps: OrchestratorDeps): {
     const candidates: EnqueueCandidate[] = [];
     for (const b of post.contents) {
       let zipDone = false;
-      if (deps.zip.eligible(b, s)) {
+      const isZipPlanned = zipPlannedByBlock.get(b) ?? false;
+      if (isZipPlanned) {
         const collected = await deps.zip.collect(b.files.map((f) => ({ url: f.url, idemKey: f.idemKey, size: f.size })), post.postId, {});
         if (collected.ok) {
           try {
@@ -235,6 +281,62 @@ export function createOrchestrator(deps: OrchestratorDeps): {
         }
       }
       if (zipDone) continue; // spec §7b: zip 成立ブロックは個別 enqueue しない
+      if (isZipPlanned) {
+        // codex レビュー round5 フォローアップ: zip 予定だったが実際には不成立だった
+        // ブロックに限り、bulk recovery で据え置いた(needs_page のまま残した)
+        // このブロックの既存レコードへ、ここで初めて正規の回復ロジックを掛け直す
+        // (同一 URL は拒否 / URL 変更は世代交代)。zip 予定ブロックの files は
+        // zipEligible の前提上すべて contentType "photo"(かつ有効)なので、
+        // contentType フィルタは不要。
+        //
+        // codex レビュー round5 再指摘その1(P1): applyNeedsPageRecovery は postId 全体の
+        // needs_page を走査するため、fresh をこのブロックの files だけにすると、
+        // まだ処理順が回ってきていない他ブロック(他の zip 予定ブロックや
+        // contentType 無効化分)の据え置き中レコードまで missing 化されてしまう。
+        // phase 1 と同じ「復元スナップショット」パターンで、このブロック以外の
+        // needs_page はここでは触らない(missing 化を都度取り消す)。
+        //
+        // codex レビュー round5 再指摘その2(P2): basePath の renderTemplate 呼び出しは
+        // 後段の候補ループと同じく TemplateError を捕捉し、後段と同じ
+        // 「テンプレートエラー」応答 + finish() に倒す(素通しで throw させない)。
+        let blockFresh: Array<{ stableContentId: string; url: string; basePath: string }>;
+        try {
+          blockFresh = b.files.map((f) => ({
+            stableContentId: f.stableContentId, url: f.url,
+            basePath: renderTemplate(s.pathTemplate, buildRenderContext(post, b, f, now), { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen }),
+          }));
+        } catch (e) {
+          res.errors.push(e instanceof TemplateError ? `テンプレートエラー: ${e.message}` : String(e));
+          return finish();
+        }
+        const blockIds = new Set(blockFresh.map((f) => f.stableContentId));
+        try {
+          const rec2 = await store.commit((l) => {
+            const toRestore2 = Object.values(l.jobs).filter(
+              (j) => j.postId === post.postId && j.state === "needs_page" && !blockIds.has(j.stableContentId),
+            );
+            const r = applyNeedsPageRecovery(l, post.postId, blockFresh, { now: deps.now(), postUpdatedAt: post.updatedAtIso, newLeaseToken, validatePath: vp, invalidIds });
+            let ledger = r.ledger;
+            let missing = r.missing;
+            if (toRestore2.length > 0) {
+              const restoreKeys = new Set(toRestore2.map((j) => j.idemKey));
+              const jobs = { ...ledger.jobs };
+              for (const orig of toRestore2) jobs[orig.idemKey] = orig; // 他ブロック分の missing 化を取り消す
+              ledger = { ...ledger, jobs };
+              missing = missing.filter((k) => !restoreKeys.has(k));
+            }
+            return { ledger, result: { ...r, missing } };
+          });
+          for (const j of rec2.toStart) { pending.push(startDownload(j)); res.queued++; }
+          for (const k of rec2.missing) res.errors.push(`${k}: 投稿が編集され該当ファイルは存在しません`);
+          for (const k of rec2.refused) res.errors.push(`${k}: 同じ URL のままサーバ側の失敗が続いています。時間を置いて再試行してください`);
+          for (const k of rec2.invalid) res.errors.push(`${k}: メディア URL が許可外のためダウンロードできません`);
+          res.errors.push(...rec2.errors);
+        } catch (e) {
+          if (e instanceof StorageWriteError) { res.errors.push(e.message); return finish(); }
+          throw e;
+        }
+      }
       for (const f of b.files) {
         if (!(s.contentTypes as any)[f.contentType]) continue;
         let basePath: string;

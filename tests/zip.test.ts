@@ -1,8 +1,25 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { unzipSync } from "fflate";
 import { zipEligible, collectZipSources, buildZip, ZIP_SOURCE_BUDGET_BYTES, ZIP_MAX_FILES, registerZipDownload, handleZipDownloadChange, downloadZipViaOffscreen } from "../src/background/zip";
 import { DEFAULT_SETTINGS } from "../src/core/settings";
 import type { ContentBlock, FileItem } from "../src/core/types";
+
+// 最終レビュー round5 P2c: buildZip の entryPath 実行時検証を、renderTemplate の実装から
+// 独立してテストする。core の sanitizeSegment は "../" のような純ドットセグメントを
+// 通常経路では既に無害化するため(先頭/末尾ドット trim)、実際に不正な entryPath が
+// renderTemplate から返ってくる状況(古い同期設定・将来の実装変化等)を、
+// zipEntryTemplate 呼び出しだけを狙ったマーカーテンプレで模擬する。
+// 他のテンプレ(zipPathTemplate 等)は実装そのまま(actual)に委譲するため、
+// このモックは本ファイルの他のテストに影響しない。
+const MALICIOUS_ENTRY_TEMPLATE = "__MALICIOUS_ZIP_ENTRY_TEMPLATE__";
+vi.mock("../src/core/template-engine", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/core/template-engine")>();
+  return {
+    ...actual,
+    renderTemplate: (tpl: string, ctx: any, opts: any) =>
+      tpl === MALICIOUS_ENTRY_TEMPLATE ? "../evil.jpg" : actual.renderTemplate(tpl, ctx, opts),
+  };
+});
 
 const item = (id: string): FileItem => ({
   contentType: "photo", url: `https://downloads.fanbox.cc/images/post/1/${id}.jpg`,
@@ -114,6 +131,22 @@ describe("buildZip (spec §7b 黙った欠落の禁止)", () => {
     // fantia-dl と同一の " (n)" 規則をエントリ名で直接検証する
     const entries = Object.keys(unzipSync(bytes));
     expect(entries.sort()).toEqual(["same (2).jpg", "same.jpg"]);
+  });
+  it("entryPath が ../ を含むと buildZip が throw する(実行時検証・fail-closed) (最終レビュー round5 P2c)", () => {
+    const b = block(1);
+    const s = { ...DEFAULT_SETTINGS, zipEntryTemplate: MALICIOUS_ENTRY_TEMPLATE };
+    const buffers = new Map(b.files.map((f) => [f.idemKey, new Uint8Array(1)]));
+    expect(() => buildZip(post, b, buffers, s, new Date())).toThrow(/entryPath|不正/);
+  });
+  it("entryPath の実行時検証はダウンロードパスの uniquify headroom を誤って流用しない(zip 内エントリ名は browser の uniquify 対象外) (codex レビュー round5 指摘)", () => {
+    // fullPathMaxLen(既定 180) - uniquifyHeadroom(既定 16) = 164 を超えるが
+    // fullPathMaxLen 自体(180)以下の長さの entry 名は、zip 内部名には
+    // browser の uniquify サフィックスが付かないため throw してはならない。
+    const b = block(1);
+    const longFilename = "a".repeat(DEFAULT_SETTINGS.fullPathMaxLen - 4); // + ".jpg" で fullPathMaxLen ちょうど
+    b.files = b.files.map((f) => ({ ...f, filename: longFilename }));
+    const buffers = new Map(b.files.map((f) => [f.idemKey, new Uint8Array(1)]));
+    expect(() => buildZip(post, b, buffers, DEFAULT_SETTINGS, new Date())).not.toThrow();
   });
 });
 
