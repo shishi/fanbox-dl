@@ -1,0 +1,45 @@
+d7528b5 chore: scaffold repo with fantia-dl toolchain and core pure functions
+---
+ .envrc                                 |   1 +
+ .github/dependabot.yml                 |   8 +
+ .github/renovate.json                  |  83 ++++++++++
+ .gitignore                             |   3 +
+ .superpowers/sdd/global-constraints.md |  16 ++
+ .superpowers/sdd/task-1-brief.md       |  59 +++++++
+ bun.lock                               | 275 +++++++++++++++++++++++++++++++++
+ flake.lock                             |  61 ++++++++
+ flake.nix                              |  19 +++
+ package.json                           |  21 +++
+ scripts/build.mjs                      |  27 ++++
+ src/core/base64.ts                     |  19 +++
+ src/core/path-validator.ts             |  19 +++
+ src/core/sanitizer.ts                  |  35 +++++
+ src/core/settings.ts                   |  32 ++++
+ src/core/template-engine.ts            | 106 +++++++++++++
+ src/core/types.ts                      |  54 +++++++
+ tests/path-validator.test.ts           |  36 +++++
+ tests/sanitizer.test.ts                |  37 +++++
+ tests/settings.test.ts                 |  24 +++
+ tests/template-engine.test.ts          |  54 +++++++
+ tsconfig.json                          |  14 ++
+ vitest.config.ts                       |   2 +
+ 23 files changed, 1005 insertions(+)
+---
+SAME: src/core/template-engine.ts
+SAME: src/core/sanitizer.ts
+SAME: src/core/path-validator.ts
+SAME: src/core/base64.ts
+SAME: src/core/types.ts
+SAME: src/core/settings.ts
+SAME: tests/template-engine.test.ts
+SAME: tests/sanitizer.test.ts
+SAME: tests/path-validator.test.ts
+SAME: tests/settings.test.ts
+SAME: tsconfig.json
+SAME: vitest.config.ts
+SAME: scripts/build.mjs
+SAME: flake.nix
+SAME: .envrc
+SAME: .gitignore
+---
+package.json: name のみ差分

@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "fanbox-dl",
+  "version": "0.0.2",
+  "description": "pixivFANBOX downloader (walking skeleton v2 - content script gate)",
+  "permissions": ["downloads", "storage", "offscreen"],
+  "host_permissions": ["https://*.fanbox.cc/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://*.fanbox.cc/*"],
+      "js": ["content/content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": { "default_title": "fanbox-dl gate v2" },
+  "icons": {}
+}

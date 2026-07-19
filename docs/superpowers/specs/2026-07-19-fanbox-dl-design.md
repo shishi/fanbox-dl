@@ -33,8 +33,8 @@ fantia-dl と同一の Manifest V3・5 モジュール分離。
 
 | モジュール | 責務 | fantia-dl からの変更 |
 |---|---|---|
-| content script | DL ボタン注入 / postId 抽出 / background へ DL 依頼 | URL パターンと postId 抽出のみ変更。CSRF 抽出と **page script 注入機構は削除**(§4a) |
-| background (service worker) | **`post.info` の canonical fetch(§4a)** / ジョブ永続化 / テンプレ展開 / 検証 / **DL URL の allowlist 検証** / `chrome.downloads` 実行 | URL 再解決ロジック削除。API fetch と allowlist 検証が加わる |
+| content script | DL ボタン注入 / postId 抽出 / **isolated world から `post.info` fetch(§4a canonical)** / 受領 json を SW へ送信 | CSRF 抽出と page script 注入機構は削除。post.info fetch は isolated world が担う(§4a: SW fetch は Origin 起因で 400) |
+| background (service worker) | **受領 json の schema+allowlist 検証(§4a)** / ジョブ永続化 / テンプレ展開 / 検証 / **DL URL の allowlist 検証** / zip 用ソース fetch(§7b)/ `chrome.downloads` 実行 | URL 再解決ロジック削除。post.info fetch は content script へ移動。受領データの検証と allowlist が加わる |
 | core(template-engine / sanitizer / path-validator / settings / base64) | 純粋関数群 | **無改造でコピー**(テストごと流用) |
 | offscreen + fflate | zip モードの blob 生成・zip 用バイナリ取得 | zip 生成は無改造。**バイナリ取得経路は再設計**(§7b) |
 
@@ -75,34 +75,52 @@ fantia-dl と同一の Manifest V3・5 モジュール分離。
 - **URL 形式(確定)**: クリエイターページはサブドメイン形式 `https://{creatorId}.fanbox.cc/posts/{postId}`
   が正(200)。`https://www.fanbox.cc/@{creatorId}/posts/{postId}` は 302 だが SPA 内遷移で使われる。
 
+### 追加実測(2026-07-19・gate §13-6)
+- **`api.fanbox.cc` は Origin ゲートあり**: 拡張 SW からの fetch(Origin `chrome-extension://…`)は
+  cookie 付きでも **400**。ページオリジン(`https://www.fanbox.cc`)の fetch は **200**。
+  → canonical を content script isolated world fetch に変更(§4a)。
+
 ### 未実測(MVP マイルストーン1の hard gate、§13)
 - **有料投稿のファイル URL に cookie が必須か**は未実測(PoC 時点で有料プラン未加入のため)。
   §7a のフォールバック方針で吸収する。
-- **extension-context(background)からの `post.info` fetch が 200 になるか**は未実測
-  (PoC はページ文脈のみ)。§13-6 の hard gate で実証する。失敗時はフェイルクローズ(§4a)。
+- **content script(isolated world)からの `post.info` fetch が cookie 込みで 200 になるか**は
+  ページ文脈(MAIN world 相当)では 200 実証済みだが、拡張の isolated world での最終確認は
+  §13-6 の hard gate(walking skeleton v2)で行う。失敗時はフェイルクローズ(§4a)。
 
 ## 4a. post.info 取得経路と信頼境界(normative)
 
 fantia-dl は CSRF トークンの都合で MAIN-world page script が canonical だったが、
-Fanbox は cookie のみで認証できるため、**信頼境界のより強い経路を canonical にする**。
+Fanbox は cookie のみで認証できる。当初は SW fetch を canonical にしたが、
+**実測(2026-07-19、gate §13-6)で `api.fanbox.cc` が非ページ Origin のリクエストを
+400 で拒否することが判明した**(拡張 SW の Origin は `chrome-extension://…`。cookie は
+送れており 401/403 の認証エラーではない)。そこで**信頼境界を保てる範囲で最も安全な
+成立経路 = content script の isolated world fetch を canonical にする**。
 
-- **canonical**: background(service worker)が `fetch("https://api.fanbox.cc/post.info?postId=...",
-  {credentials: "include"})` を実行する。`host_permissions` により CORS 免除。
-  MAIN-world bridge を経由しないため、ページ側 JS が偽レスポンスを注入する余地がない。
-  cookie の SameSite 挙動が未実測のため **MVP1 hard gate(§13)で実証**する。
-- **フェイルクローズ(normative)**: background fetch が失敗する環境では拡張は
-  「post.info を取得できない」ことを明示エラーにして**停止する**。MAIN-world page script +
-  postMessage bridge(ページ文脈 fetch は PoC で 200 実証済み)は技術的な代替経路として
-  存在するが、bridge 応答はページ世界由来の信頼できないデータであり、フィルタしても
-  post.title / user.name / item id 等のメタデータが filename・idemKey・DL 履歴という
-  永続状態に流れ込む(偽装による履歴汚染・偽 dedup を allowlist では防げない)。
-  そのため**本 spec の normative 設計には含めない**。gate(§13-6)で background fetch が
-  不成立と判明した場合に備え、**degraded モードの契約**だけを先に固定しておく:
-  bridge 経路で得たデータは (a) 永続 ledger(`jobs`)へ一切書かない(dedup・resume・
-  needs_page 無効)、(b) allowlist 検証(§4a)は同一に適用、(c) UI に「検証不能なページ由来
-  データで動作中(履歴無効)」の常時バナーを出す、(d) セッション内(メモリ)限りの重複防止のみ
-  行う。この契約を満たす実装として spec 改訂を経てから出荷する。
-- **どちらの経路でも normative な防御(SW 側で実施)**:
+- **canonical**: content script が **isolated world** で
+  `fetch("https://api.fanbox.cc/post.info?postId=...", {credentials: "include"})` を実行する。
+  isolated world の fetch は**ページオリジン `https://www.fanbox.cc` を Origin として送る**ため
+  400 を回避できる(実測: ページ文脈 fetch = 200)。得た json は `chrome.runtime.sendMessage`
+  で background へ渡す。
+  - **信頼境界(normative)**: isolated world は拡張が注入した隔離実行環境で、ページの
+    MAIN world JS(XSS・monkeypatch 含む)から DOM も変数も fetch 呼び出しもレスポンスも
+    参照・改変できない。したがって旧 MAIN-world bridge(ページ文脈実行 = ページ JS が
+    `fetch` を差し替え可能)より信頼境界が**強い**。残る信頼リスクは fanbox サーバ自体が
+    悪意あるデータを返すことのみで、これは SW canonical でも同一であり、下記の
+    schema+allowlist 検証(SW 側)が最終防壁となる。
+  - **ページオリジンの正規化(実測 2026-07-19)**: クリエイターサブドメイン
+    `https://{creator}.fanbox.cc/posts/{id}` を開いても、ブラウザ内では
+    `https://www.fanbox.cc/@{creator}/posts/{id}` に正規化され、投稿ページの実行オリジンは
+    常に `https://www.fanbox.cc` になる(isolated world fetch の Origin もこれ)。したがって
+    どの入口 URL でも canonical fetch は成立する見込みだが、**cold direct-load(ブックマーク等で
+    サブドメイン URL を直接開く)でも 200 になることを §13-6 gate で必ず確認**する
+    (SPA 内遷移だけで通し、cold load を落とす取りこぼしを防ぐ)。
+  - `downloads.fanbox.cc`(zip 用ソース §7b / DL URL)は CORS 全拒否で content script から
+    fetch できないため、**そちらは引き続き SW fetch**(CDN のため Origin ゲート無し。
+    host_permissions で CORS 免除)。post.info(api.fanbox.cc)だけが content script 経路。
+- **フェイルクローズ(normative)**: content script fetch も失敗する環境(ログアウト等)では
+  「post.info を取得できない」ことを明示エラーにして**停止する**(部分的な状態で走らせない)。
+- **受領 json の normative な防御(SW 側で必ず実施)**: content script が渡す json は
+  isolated world 由来でページ JS 非介入とはいえ、SW は生データを信用せず次を通す:
   1. レスポンス schema 検証: `body.post.id` が要求 postId と一致すること、type / body 構造が
      既知の形であること。不一致は enqueue せず明示エラー。
   2. **メディア URL の allowlist(全ネットワーク使用前・normative)**: parse 層が受け取った
@@ -115,6 +133,24 @@ Fanbox は cookie のみで認証できるため、**信頼境界のより強い
      違反はジョブを enqueue せず(既存ジョブなら error にして)明示通知する。
      confused deputy(拡張権限・拡張 cookie 文脈での任意 URL fetch/DL)を防ぐ。
      検証は純粋関数として実装し単体テストを必須とする。
+  3. **リダイレクト対策(normative)**: allowlist は初期 URL 文字列を検証するが、fetch/DL が
+     リダイレクトを追うと allowlist 外へ抜け得る(confused deputy の再発)。
+     - **zip 用ソース SW fetch(§7b)**: `fetch(url, {credentials:"include", redirect:"error"})` とし、
+       リダイレクトが発生したら fail closed(そのブロックは zip 不成立 → 個別 DL フォールバック)。
+     - **`chrome.downloads.download`(緩和 + residual risk 明記・normative)**: API は
+       リダイレクト抑止を指定できない。完全予防には全ファイルへ preflight fetch が要り、
+       §11 のレート制限方針・§7a の「resolver 廃止/直 URL を渡す」原則と衝突するため、
+       本 spec は**予防ではなく緩和**を採る: 完了時(§7c-2 の `onChanged` terminal)に取得する
+       `DownloadItem.finalUrl` を allowlist(§4a-2)で再検証し、違反していたらそのジョブを
+       `error`(「ダウンロードが許可外 URL にリダイレクトされました」)にする
+       (実ファイルは残るが帳簿上 done にせず明示エラー・dedup 対象にしない)。この finalUrl
+       再検証も単体テストの対象。
+       **residual risk(明示)**: これは検出であって予防ではない — 悪意ある/侵害された
+       `downloads.fanbox.cc`(pixiv CDN)が allowlist 外へリダイレクトした場合、
+       検出前に 1 ファイル分のバイトがユーザーのアーカイブフォルダに書かれ得る。
+       脅威の前提が CDN 自体の侵害であり、個人アーカイブツールの文脈ではこのリスクを
+       受容する(README にも DL 元は Fanbox CDN 前提と明記)。将来レート制限が緩い経路を
+       確立できたら preflight 予防への格上げを検討する。
 
 ## 5. プレースホルダ・カタログ(fantia-dl との差分)
 
@@ -249,7 +285,7 @@ zipPathTemplate の既定を
 fantia-dl の zip 経路は MAIN-world page script が対象 URL を fetch してバイト列を得るが、
 Fanbox では `downloads.fanbox.cc` が CORS 全拒否のため**この経路は成立しない**(§4 実測)。
 
-- **canonical 経路**: background(service worker)が `fetch(url, {credentials: "include"})` で
+- **canonical 経路**: background(service worker)が `fetch(url, {credentials: "include", redirect: "error"})`(§4a-3 リダイレクト対策)で
   バイト列を取得する。`host_permissions: https://*.fanbox.cc/*` により拡張コンテキストの
   fetch は CORS 免除される(MV3 の仕様)。取得したバイト列を offscreen に渡して
   fflate で zip 化 → blob URL → `downloads.download`(zip 生成部は fantia-dl と同一)。
@@ -524,16 +560,16 @@ DL 履歴の dedup キーは `idemKey = postId:stableContentId`(安定 ID ベー
 1. **(hard gate)** image / file 各 1 件で「直 URL → `downloads.download` 実保存」を実証。
    `saveAs: false` でダイアログ無し保存(Chrome 設定 OFF 時)も確認。
 2. **(hard gate・§7a)** 有料投稿(加入後)で cookie 依存性を実証。403 なら明示エラーになることを確認し、§7a に従い一級市民フォールバックの**別 spec 化を起こす**(即時実装はしない)。
-3. (削除)— canonical は background fetch(§4a)に一本化したため、
-   isolated world / MAIN world の切替ゲートは無い。
+3. (履歴)当初の SW fetch gate は 2026-07-19 に **400 で失敗**(§4 実測)。canonical を
+   content script isolated world fetch に変更し §13-6 を差し替えた。
 4. SPA 内遷移(クリエイターページ → 投稿ページ)でボタン注入が働くか。
-5. **(hard gate・§7b)** 無料投稿で zip モード E2E(SW fetch → fflate → 実保存)。
+5. **(hard gate・§7b)** 無料投稿で zip モード E2E(SW ソース fetch → fflate → 実保存)。
    有料投稿分は §13-2 と同時に再実証。
-6. **(hard gate・§4a・実装の最初のマイルストーン)** background(SW)からの `post.info`
-   fetch が cookie 込みで 200 になること。**このゲートは実装プランの先頭に置く
-   (walking skeleton: manifest + SW + fetch だけの最小拡張で最初に実証し、
-   不成立なら他の実装に着手する前に方針を確定する)**。
-   失敗時は §4a の degraded モード契約に沿って spec を改訂してから続行する。
+6. **(hard gate・§4a・実装の最初のマイルストーン)** **content script(isolated world)**
+   からの `post.info` fetch が cookie 込みで 200 になること。**このゲートは実装プランの
+   先頭に置く(walking skeleton v2: manifest + content script + fetch + console 出力の
+   最小拡張で実証)**。不成立なら他の実装に着手する前にフェイルクローズ方針の是非を
+   ユーザーと確定する。
 
 ## 14. 設定(options)・15. テスト方針・16. 技術スタック
 
