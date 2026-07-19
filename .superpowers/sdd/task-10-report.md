@@ -59,3 +59,37 @@ Task 10「ledger 変換 B」を TDD で実装完了。以下 10 関数を ledger
 
 ## No Concerns
 実装は TDD で段階的に完成、テスト全数 green、型チェック clean。既存テストも全数パス。
+
+## 修正実装完了
+
+### 追加テスト
+1. **applyDownloadRequestFailed CAS テスト**
+   - token 一致で state="error" + terminalAt セット
+   - token 不一致で ledger 不変を検証
+
+2. **applyReissueLease CAS テスト**
+   - oldToken 一致で新 token 発行（state=pending, downloadId undefined）
+   - oldToken 不一致で record: null & ledger 不変を検証
+
+3. **同一ミューテーション prune テスト**
+   - done 2 件(上限 2)の ledger に complete → 最古が prune される
+   - 超過 ledger が一度も存在しないことを検証
+
+### 定数統一
+- `TERMINAL` (60行) 削除
+- `TERMINAL` 使用箇所 (125行) を `TERMINAL_STATES` に置換
+- `TERMINAL_STATES` (303行) に統一
+
+### テスト結果
+- Test Files: 13 passed
+- Tests: 109 passed  
+- Typecheck: 0 errors
+
+### Commit
+- SHA: 7bcaaa3
+- Message: test: cover CAS for requestFailed/reissue and same-mutation prune; dedupe TERMINAL constant
+
+### 実装状況
+- テスト追加: 3 件
+- 定数統一: 1 件完了
+- すべてのレビュー指摘を修正
