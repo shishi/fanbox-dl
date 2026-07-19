@@ -17,3 +17,7 @@ Task 15: complete (153 tests, typecheck 0, build: content/background/offscreen g
 Task 15: complete (commit 481267a, 153 tests, SPEC ✅ Approved)
   Minor(最終 triage): 起動時 reconcileZipDownloads が write-probe より先(storage.session のみ参照で実害なし)
 Task 16: complete (commit e595fd3, 153 tests, build 4-entry green, overwrite/conflictAction grep 0, controller-inspected)
+Final review: codex native 反復。round1(3件)/round2(3件・fail-closed finalUrl 一様化)を fix・再レビュー clean。
+  未解決(shishi 判断待ち):
+  - P2 template-engine.ts:101 プレースホルダ値内 / の split(sanitize 前)→ サブフォルダ化/検証失敗。ただし core 無改造コピー制約(fantia-dl パリティ)と衝突。低exploitability(各セグメント sanitize + path-validator の traversal 拒否)
+  - P3 options illegalCharReplacement に / \ を保存可(低リスク・自傷)

@@ -256,3 +256,35 @@ adoption した interrupted の hit が error(SERVER_FORBIDDEN) を持つ場合�
 Commit: `242915c` — "fix: uniform fail-closed finalUrl revalidation across
 all completion/adoption paths + preserve interrupted reason (final review
 round 2)"
+
+## Final review round 3 (P2/P3 残り2件)
+
+- コミット: 5b996cd fix: neutralize path separators in placeholder values at adapter; reject invalid illegalCharReplacement (final review round 3)
+- P2: render-adapter.ts に純粋関数 `neutralizePathSeparators(s)` を追加し、buildRenderContext/buildZipRenderContext が
+  creator/creatorId/postTitle/contentType/plan/filename/ext を RenderContext に格納する前に / と \ を _ に中和するよう変更。
+  tests/render-adapter.test.ts に「値に / や \ を含むとサブフォルダ化しない」テスト3件を追加(TDD: RED確認後にGREEN)。
+- P3: src/options/validate-templates.ts に純粋関数 `illegalReplacementError(rep)` を追加(/ か \ を含めば日本語エラー、
+  空文字は options.ts 側の "_" フォールバック契約により null)。tests/options-validate-templates.test.ts に6件追加。
+  options.ts の save ハンドラで既存の hasBlockingTemplateError ガードに加えて illegalReplacementError もチェックし、
+  エラーなら alert して保存拒否するよう変更。
+- codex native レビュー(1回目)で追加指摘: options.ts の保存ガードは新規保存しか防がず、旧バージョンからの引き継ぎ・
+  他ブラウザ同期で既に永続化された illegalCharReplacement が / や \ を含む場合、production の render 経路
+  (orchestrator.ts の handleDownloadRequest)がそのまま core の renderTemplate に渡してしまい、P2 の中和効果が
+  sanitizeSegment の置換文字挿入によって無効化される実害パスが残っていた(core は無改造のため split → sanitize の
+  順序は変えられない)。
+  - TDD で再現テストを追加(tests/orchestrator.test.ts: postTitle に ":" を含め、illegalCharReplacement="/" を
+    持つ設定で handleDownloadRequest を呼ぶと relPath のセグメント数が想定より1つ多くなることを確認 → RED)。
+  - orchestrator.ts の handleDownloadRequest 冒頭(loadSettings 直後の唯一の呼び出し箇所)で
+    `neutralizePathSeparators(loaded.illegalCharReplacement)` を適用してから s として以降(renderTemplate と
+    zip.build 双方が共有する同一 Settings オブジェクト)に流すよう修正 → GREEN。
+  - codex native レビュー(2回目)で新たな指摘: この修正により既存(旧挙動由来)の永続化済みジョブの basePath が
+    変わり得るため、次回クリック時に applyEnqueue の dedup 判定(`prev.relPath === canonicalRelPath(...)`)が
+    外れて新 generation の重複 DL が発生し得る、という P2 指摘。ただしこれは uniquify の「無言上書きが構造的に
+    起きない」という既存設計契約(spec §7c-2/§8、core 無改造)そのものであり、path テンプレ編集など他の
+    設定変更でも同様に発生する既知・容認済みのトレードオフ(core/ledger の dedup/migration ロジックへの変更は
+    本タスクのスコープ外 かつ core 無改造制約に抵触)。本ラウンドでは対応せず、懸念事項として記録するのみとした。
+- 完了確認: `bun run test` 181 tests green(ベースライン171 → +10: render-adapter +3, options-validate-templates +6,
+  orchestrator +1)。`bun run typecheck` 0 errors。`bun run build` 成功(4 entry: content-script/service-worker/options/offscreen)。
+- core(src/core/*)無変更確認: `git diff --stat f5024dc..HEAD -- src/core` は空(直前コミットからの差分ゼロ)。
+  `git diff --stat 7865aaa..HEAD -- src/core` は 7865aaa(docs専用ベースライン)以降に追加された core ファイル群の
+  総追加行のみを示し、削除/変更行は無い(= 実装コミット群を通じて core は一貫して無改造)。
