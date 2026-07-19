@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>fanbox-dl 設定</title>
+<style>
+body{font-family:sans-serif;max-width:820px;margin:24px auto;padding:0 16px}
+label{display:block;margin:12px 0 4px;font-weight:bold}
+input[type=text]{width:100%;padding:6px}
+.preview{display:inline-block;background:#f4f4f4;padding:6px 10px;border-radius:6px;white-space:pre-wrap;font-size:13px;margin-top:4px;word-break:break-all}
+.err{color:#c00;font-size:13px;min-height:1em}
+.note{color:#666;font-size:13px}
+.tpl-group{margin-bottom:20px}
+.tpl-group input[type=text]{margin-bottom:2px}
+details{margin:8px 0 20px;padding:8px 12px;background:#fafafa;border:1px solid #e0e0e0;border-radius:6px}
+summary{cursor:pointer;font-weight:bold;font-size:13px}
+.ph-table{border-collapse:collapse;width:100%;font-size:13px;margin:12px 0}
+.ph-table th,.ph-table td{border:1px solid #ddd;padding:4px 8px;text-align:left;vertical-align:top}
+.ph-table th{background:#eee}
+code{background:#eaeaea;padding:1px 4px;border-radius:3px;font-size:12px;font-family:monospace}
+</style>
+</head><body>
+<h1>fanbox-dl 設定</h1>
+
+<div class="tpl-group">
+  <label>① 通常保存パステンプレート(単体ファイル DL 時)</label>
+  <input id="tpl" type="text">
+  <div>プレビュー: <span id="preview" class="preview"></span></div>
+  <div id="tplErr" class="err"></div>
+</div>
+
+<div class="tpl-group">
+  <label>② zip ファイルのパステンプレート(複数枚 photo を zip 化するとき)</label>
+  <input id="zip_path_tpl" type="text">
+  <div>プレビュー: <span id="zip_path_preview" class="preview"></span></div>
+  <div id="zipPathErr" class="err"></div>
+</div>
+
+<div class="tpl-group">
+  <label>③ zip 内エントリの命名テンプレート(zip の中身のファイル名)</label>
+  <input id="zip_entry_tpl" type="text">
+  <div>プレビュー: <span id="zip_entry_preview" class="preview"></span></div>
+  <div id="zipEntryErr" class="err"></div>
+</div>
+
+<details>
+<summary>プレースホルダ・記法の説明(クリックで展開)</summary>
+
+<table class="ph-table">
+<thead><tr><th>記号</th><th>意味</th><th>例</th></tr></thead>
+<tbody>
+<tr><td><code>$creator</code></td><td>クリエイター名</td><td>sample_creator</td></tr>
+<tr><td><code>$creatorId</code></td><td>クリエイター ID</td><td>1234</td></tr>
+<tr><td><code>$postTitle</code></td><td>投稿タイトル</td><td>サンプル投稿</td></tr>
+<tr><td><code>$postId</code></td><td>投稿 ID</td><td>1234567</td></tr>
+<tr><td><code>$date{書式}</code></td><td>投稿日を書式で展開</td><td><code>$date{YYYYMMDD}</code> → 20260115</td></tr>
+<tr><td><code>$today{書式}</code></td><td>実行日を書式で展開</td><td><code>$today{YYYY-MM-DD}</code> → 2026-07-19 (実行日)</td></tr>
+<tr><td><code>$contentId</code></td><td>投稿内のメディアブロック通し番号</td><td>42</td></tr>
+<tr><td><code>$contentType</code></td><td>photo / file / video のいずれか</td><td>photo</td></tr>
+<tr><td><code>$plan</code></td><td>投稿の必要支援額(feeRequired)</td><td>0 / 500</td></tr>
+<tr><td><code>$filename</code></td><td>ファイル名(拡張子除く)。photo は UUID basename、file/video は投稿者が upload した元名</td><td>image / video_a</td></tr>
+<tr><td><code>$ext</code></td><td>拡張子(ドットなし)</td><td>png / mp4</td></tr>
+<tr><td><code>$seq</code></td><td>ブロック内の連番(2 件以上ある時のみ、単一なら空)</td><td>2</td></tr>
+<tr><td><code>$seq{N}</code></td><td>N 桁ゼロ詰めの連番</td><td><code>$seq{3}</code> → 002</td></tr>
+<tr><td><code>$total</code></td><td>ブロック内の総ファイル数</td><td>4</td></tr>
+</tbody>
+</table>
+
+<p class="note"><code>$contentTitle</code> は Fanbox には存在しないため常に空文字列になります。<code>[...]</code> に入れると丸ごと消えます。</p>
+
+<p><b><code>/</code> で階層(サブフォルダ)</b>:テンプレ内の <code>/</code> は保存先のサブフォルダ区切りとして扱われます。例:</p>
+<ul>
+<li><code>fanbox/$creatorId/$postTitle.png</code> → <code>fanbox/1234/サンプル投稿.png</code>(3 階層のフォルダに保存)</li>
+<li>階層は何段でも OK、各階層のセグメントは自動 sanitize(Windows 禁止文字 <code>/ \ : * ? " &lt; &gt; |</code> は置換文字に、末尾ドット/空白は除去、予約名 <code>CON</code> 等は回避)</li>
+</ul>
+
+<p><b>日付書式</b>:<code>$date{}</code> / <code>$today{}</code> の中に書くトークン。それ以外の文字はリテラルとして残ります。</p>
+<ul>
+<li><code>YYYY</code> 4 桁年 / <code>YY</code> 2 桁年</li>
+<li><code>MM</code> ゼロ詰め 2 桁月 / <code>M</code> ゼロ詰めなし月</li>
+<li><code>DD</code> ゼロ詰め 2 桁日 / <code>D</code> ゼロ詰めなし日</li>
+<li><code>HH</code> 時 / <code>mm</code> 分 / <code>ss</code> 秒</li>
+<li>例:<code>$date{YYYY-MM-DD_HHmm}</code> → 2026-01-15_1230</li>
+</ul>
+
+<p><b>オプショナルグループ <code>[ ... ]</code></b>:内側にプレースホルダを 1 つ以上含む場合、そのいずれかが空文字に解決したら <b>[...] ごと消える</b>。単一 photo で <code>$seq</code> が空になった時に連番プレフィックスも一緒に消したい、みたいなユースケース用。</p>
+<ul>
+<li>例:<code>[$seq{3}_]$filename.$ext</code>
+  <ul>
+  <li>複数(seq=2)→ <code>002_aaa.png</code></li>
+  <li>単一(seq=空)→ <code>aaa.png</code>(<code>_</code> も含めて消える)</li>
+  </ul>
+</li>
+<li>ネスト可:<code>x[a[$seq]_b]y</code> の内側が空なら外側も丸ごと消える</li>
+</ul>
+
+<p><b>例テンプレ(既定値)</b>:</p>
+<ul>
+<li>単体:<code>fanbox/$creatorId/$date{YYYYMMDD}_$postTitle/[$seq{3}_]$filename.$ext</code></li>
+<li>zip ファイル:<code>fanbox/$creatorId/$date{YYYYMMDD}_$postTitle/images_$contentId.zip</code></li>
+<li>zip 内エントリ:<code>[$seq{3}_]$filename.$ext</code></li>
+</ul>
+
+</details>
+
+<label>禁止文字の置換</label><input id="repl" type="text">
+
+<label>対象コンテンツ</label>
+<label class="note"><input type="checkbox" id="ct_photo"> 画像</label>
+<label class="note"><input type="checkbox" id="ct_file"> ファイル</label>
+<label class="note"><input type="checkbox" id="ct_video"> 動画(file .mp4 等)</label>
+<label class="note"><input type="checkbox" id="zip_galleries"> 複数枚 photo は zip にまとめる</label>
+<p class="note">zip は再開不可の一括処理で、DL 履歴にも残りません。大きい投稿や確実性が要る場合は通常ダウンロード推奨(zip にできない場合は自動で個別ダウンロードに切り替わります)。</p>
+
+<p class="note">⚠ 保存ダイアログが出る場合は Chrome 設定「ダウンロード前に各ファイルの保存場所を確認する」を OFF にしてください。拡張からは強制できません。</p>
+
+<hr style="margin: 24px 0; border: 0; border-top: 1px solid #ccc;">
+<label>DL 履歴の管理</label>
+<p class="note">
+  完了(done)状態の履歴は 1 年後に自動削除されます。
+  同じ投稿の再ダウンロード判定に使われているので、消すと dedup が無効化されます。
+</p>
+<p>
+  <button id="clearHistory" type="button">DL 履歴を全部クリア</button>
+  <span id="clearedNotice" class="note"></span>
+</p>
+
+<p><button id="save">保存</button> <span id="saved" class="note"></span></p>
+<script type="module" src="./options.js"></script>
+</body></html>

@@ -1,0 +1,403 @@
+=== commits ===
+60630b8 feat: SW-driven zip pipeline with byte budget and offscreen blob download
+
+=== diff (zip.ts + test) ===
+diff --git a/src/background/zip.ts b/src/background/zip.ts
+new file mode 100644
+index 0000000..a3e22f3
+--- /dev/null
++++ b/src/background/zip.ts
+@@ -0,0 +1,243 @@
++import { zipSync } from "fflate";
++import { bytesToBase64 } from "../core/base64";
++import { renderTemplate } from "../core/template-engine";
++import { validateMediaUrl } from "../core/url-allowlist";
++import { CONFLICT_ACTION } from "../core/settings";
++import { buildRenderContext, buildZipRenderContext } from "./render-adapter";
++import { OFFSCREEN_TARGET } from "../offscreen/protocol";
++import type { OffscreenChunkMessage, OffscreenDoneMessage, OffscreenRevokeMessage, OffscreenResult } from "../offscreen/protocol";
++import type { ContentBlock, PostData, Settings } from "../core/types";
++
++// spec §7b: 事前チェックと実行時バジェットは同一の名前付き定数を参照する
++export const ZIP_SOURCE_BUDGET_BYTES = 100 * 1024 * 1024;
++export const ZIP_MAX_FILES = 100;
++const ZIP_CHUNK_BYTES = 4 * 1024 * 1024;
++
++// spec §7b の必須文言 2 種。フォールバック文は click 通知用、リトライ文は click 通知への
++// 併記と blob DL 発行後の console ログ(配達経路が異なる 2 契約を別定数で保持)
++export const ZIP_FALLBACK_WORDING = "この投稿(の一部)は zip にできないため個別ダウンロードに切り替えました";
++export const ZIP_RETRY_WORDING = "zip は最初からやり直し。確実性が要るなら通常 DL を。";
++
++export function zipEligible(block: ContentBlock, s: Settings): boolean {
++  return block.contentType === "photo" && block.files.length >= 2 && s.zipGalleries && s.contentTypes.photo;
++}
++
++export interface ChunkedResponse {
++  ok: boolean; status: number;
++  chunks(): AsyncIterable<Uint8Array>;
++  abort(): void;
++}
++type BinFetch = (url: string, init?: RequestInit) => Promise<ChunkedResponse>;
++
++// 実 fetch を ChunkedResponse に包む(ReadableStream をチャンク単位で読む)
++function realBinFetch(url: string, init?: RequestInit): Promise<ChunkedResponse> {
++  return fetch(url, init).then((res) => {
++    const reader = res.body?.getReader();
++    return {
++      ok: res.ok, status: res.status,
++      async *chunks() {
++        if (!reader) return;
++        for (;;) {
++          const { done, value } = await reader.read();
++          if (done) return;
++          if (value) yield value;
++        }
++      },
++      abort: () => { void reader?.cancel().catch(() => {}); },
++    };
++  });
++}
++
++export async function collectZipSources(
++  files: Array<{ url: string; idemKey: string; size?: number }>, postId: string,
++  deps: { fetchFn?: BinFetch; budget?: number } = {},
++): Promise<{ ok: true; buffers: Map<string, Uint8Array> } | { ok: false; error: string }> {
++  const fetchFn = deps.fetchFn ?? realBinFetch;
++  const budget = deps.budget ?? ZIP_SOURCE_BUDGET_BYTES;
++  if (files.length > ZIP_MAX_FILES) return { ok: false, error: `zip 件数上限(${ZIP_MAX_FILES})超過` };
++  // spec §7b(a): サイズ既知の item の合計での事前チェック(1 バイトも fetch せずに拒否)
++  const knownTotal = files.reduce((n, f) => n + (typeof f.size === "number" ? f.size : 0), 0);
++  if (knownTotal > budget) return { ok: false, error: `zip ソース既知サイズ合計がバイト上限(${budget})を超過` };
++  const buffers = new Map<string, Uint8Array>();
++  let used = 0;
++  for (const f of files) {
++    const v = validateMediaUrl(f.url, postId); // spec §4a: zip ソース fetch も allowlist 必須
++    if (!v.ok) return { ok: false, error: v.error };
++    let r: ChunkedResponse;
++    try {
++      // spec §4a-3: リダイレクトは allowlist を抜け得るため fail-closed(realBinFetch は throw → catch で error)
++      r = await fetchFn(f.url, { credentials: "include", redirect: "error" });
++    } catch (e) {
++      return { ok: false, error: `zip ソース取得に失敗: ${String(e)}` };
++    }
++    if (!r.ok) return { ok: false, error: `zip ソース取得が status ${r.status}` };
++    // spec §7b: 累積受信バイトをチャンク単位で計上し、超えた「時点」で abort して中止
++    // (超過分をメモリに保持しない)。
++    const parts: Uint8Array[] = [];
++    let over = false;
++    for await (const chunk of r.chunks()) {
++      used += chunk.byteLength;
++      if (used > budget) { over = true; r.abort(); break; }
++      parts.push(chunk);
++    }
++    if (over) return { ok: false, error: `zip ソース合計がバイト上限(${budget})を超過したため中止` };
++    const buf = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
++    let off = 0;
++    for (const p of parts) { buf.set(p, off); off += p.byteLength; }
++    buffers.set(f.idemKey, buf);
++  }
++  return { ok: true, buffers };
++}
++
++export function buildZip(
++  post: PostData, block: ContentBlock, buffers: Map<string, Uint8Array>, s: Settings, now: Date,
++): { zipPath: string; bytes: Uint8Array } {
++  const entries: Record<string, Uint8Array> = {};
++  const usedNames = new Set<string>();
++  for (const f of block.files) {
++    const buf = buffers.get(f.idemKey);
++    // spec §7b: 黙った欠落の禁止。ソースが揃っていない zip は組み立てず error にして
++    // 呼び出し側の個別 DL フォールバックに乗せる。
++    if (!buf) throw new Error(`zip ソース欠落: ${f.idemKey}`);
++    const ctx = buildRenderContext(post, block, f, now);
++    let entryPath = renderTemplate(s.zipEntryTemplate, ctx, { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen });
++    // テンプレが $seq を含まない等の衝突 -> 静かな上書きを防ぐため連番(fantia-dl と同一規則)
++    if (usedNames.has(entryPath)) {
++      const dot = entryPath.lastIndexOf(".");
++      const stem = dot > 0 ? entryPath.slice(0, dot) : entryPath;
++      const ext = dot > 0 ? entryPath.slice(dot) : "";
++      let n = 2;
++      let candidate = `${stem} (${n})${ext}`;
++      while (usedNames.has(candidate)) { n++; candidate = `${stem} (${n})${ext}`; }
++      entryPath = candidate;
++    }
++    usedNames.add(entryPath);
++    entries[entryPath] = buf;
++  }
++  const zipCtx = buildZipRenderContext(post, block, now);
++  const zipPath = renderTemplate(s.zipPathTemplate, zipCtx, { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen });
++  return { zipPath, bytes: zipSync(entries) };
++}
++
++// --- 以下、offscreen 経由の blob DL(fantia-dl service-worker.ts の zip 部分を移植) ---
++const zipDownloads = new Map<number, string>(); // downloadId -> blobUrl のインメモリキャッシュ
++const ZIP_DOWNLOADS_STORAGE_KEY = "zipDownloads";
++
++async function persistZipDownloads(): Promise<void> {
++  await chrome.storage.session.set({ [ZIP_DOWNLOADS_STORAGE_KEY]: Object.fromEntries(zipDownloads) });
++}
++
++async function loadZipDownloads(): Promise<void> {
++  const r = await chrome.storage.session.get(ZIP_DOWNLOADS_STORAGE_KEY);
++  const obj = (r?.[ZIP_DOWNLOADS_STORAGE_KEY] as Record<string, string>) ?? {};
++  for (const [id, url] of Object.entries(obj)) zipDownloads.set(Number(id), url);
++}
++
++let offscreenReadyPromise: Promise<void> | null = null;
++
++async function ensureOffscreenDocument(): Promise<void> {
++  if (!offscreenReadyPromise) {
++    offscreenReadyPromise = (async () => {
++      if (await chrome.offscreen.hasDocument()) return;
++      await chrome.offscreen.createDocument({
++        url: chrome.runtime.getURL("offscreen/offscreen.html"),
++        reasons: [chrome.offscreen.Reason.BLOBS],
++        justification: "zip Blob を組み立てて downloads.download 用の object URL を作るため(Service Worker には URL.createObjectURL が無い)",
++      });
++    })().catch((e) => {
++      offscreenReadyPromise = null;
++      throw e;
++    });
++  }
++  return offscreenReadyPromise;
++}
++
++function sendChunkToOffscreen(jobId: string, base64: string): Promise<unknown> {
++  return chrome.runtime.sendMessage({
++    target: OFFSCREEN_TARGET, kind: "zipChunk", jobId, base64,
++  } satisfies OffscreenChunkMessage);
++}
++
++interface ZipPortResult {
++  queued: number;
++  error?: string;
++}
++
++async function finishZipDownload(jobId: string, filename: string): Promise<ZipPortResult> {
++  const res = (await chrome.runtime.sendMessage({
++    target: OFFSCREEN_TARGET, kind: "zipDone", jobId, mimeType: "application/zip",
++  } satisfies OffscreenDoneMessage)) as OffscreenResult | undefined;
++
++  if (!res || !res.ok) {
++    return { queued: 0, error: res?.error ?? "offscreen document から応答がありませんでした" };
++  }
++
++  const blobUrl = res.url;
++  try {
++    const downloadId = await chrome.downloads.download({ url: blobUrl, filename, saveAs: false, conflictAction: CONFLICT_ACTION });
++    zipDownloads.set(downloadId, blobUrl);
++    await persistZipDownloads();
++    return { queued: 1 };
++  } catch (e) {
++    await revokeOffscreenUrl(blobUrl);
++    return { queued: 0, error: String(e) };
++  }
++}
++
++function revokeOffscreenUrl(url: string): Promise<unknown> {
++  return chrome.runtime.sendMessage({
++    target: OFFSCREEN_TARGET, kind: "revoke", url,
++  } satisfies OffscreenRevokeMessage).catch(() => {});
++}
++
++export async function downloadZipViaOffscreen(zipPath: string, bytes: Uint8Array): Promise<{ ok: boolean; error?: string }> {
++  await ensureOffscreenDocument();
++  const jobId = crypto.randomUUID();
++  for (let off = 0; off < bytes.byteLength; off += ZIP_CHUNK_BYTES) {
++    await sendChunkToOffscreen(jobId, bytesToBase64(bytes.subarray(off, Math.min(off + ZIP_CHUNK_BYTES, bytes.byteLength))));
++  }
++  const res = await finishZipDownload(jobId, zipPath);
++  return res.queued === 1 ? { ok: true } : { ok: false, error: res.error };
++}
++
++// --- handleZipDownloadChange と registerZipDownload の deps 注入インタフェース ---
++export interface ZipChangeDeps {
++  revoke(url: string): Promise<unknown>;
++  log(msg: string): void;
++  persist(): Promise<void>;
++}
++
++export function registerZipDownload(downloadId: number, blobUrl: string, deps?: ZipChangeDeps): void {
++  zipDownloads.set(downloadId, blobUrl);
++}
++
++export async function handleZipDownloadChange(
++  delta: chrome.downloads.DownloadDelta, deps?: ZipChangeDeps,
++): Promise<boolean> {
++  const { id, state } = delta;
++  if (!id) return false;
++  const blobUrl = zipDownloads.get(id);
++  if (!blobUrl) return false;
++
++  const d = deps ?? { revoke: revokeOffscreenUrl, log: console.error, persist: persistZipDownloads };
++  if (state?.current === "interrupted") {
++    zipDownloads.delete(id);
++    await d.revoke(blobUrl);
++    d.log(`[fanbox-dl] zip のダウンロードに失敗しました。${ZIP_RETRY_WORDING}`);
++    await d.persist();
++    return true;
++  }
++  if (state?.current === "complete") {
++    zipDownloads.delete(id);
++    await d.revoke(blobUrl);
++    await d.persist();
++    return true;
++  }
++  return false;
++}
++
++export async function reconcileZipDownloads(): Promise<void> {
++  await loadZipDownloads();
++  // 起動時: storage.session から復元した zipDownloads をオンメモリキャッシュとして使用
++  // これ以降の中断チェックや revoke で使われる
++}
+diff --git a/tests/zip.test.ts b/tests/zip.test.ts
+new file mode 100644
+index 0000000..49d7957
+--- /dev/null
++++ b/tests/zip.test.ts
+@@ -0,0 +1,144 @@
++import { describe, it, expect } from "vitest";
++import { unzipSync } from "fflate";
++import { zipEligible, collectZipSources, buildZip, ZIP_SOURCE_BUDGET_BYTES, ZIP_MAX_FILES, registerZipDownload, handleZipDownloadChange } from "../src/background/zip";
++import { DEFAULT_SETTINGS } from "../src/core/settings";
++import type { ContentBlock, FileItem } from "../src/core/types";
++
++const item = (id: string): FileItem => ({
++  contentType: "photo", url: `https://downloads.fanbox.cc/images/post/1/${id}.jpg`,
++  filename: id, ext: "jpg", seq: 1, total: 1, idemKey: `1:image:${id}`,
++  stableContentId: `image:${id}`, refetch: { postId: "1", stableContentId: `image:${id}`, index: 0 },
++});
++const block = (n: number): ContentBlock => ({
++  blockOrdinal: 1, contentType: "photo",
++  files: Array.from({ length: n }, (_, i) => item(`f${i}`)),
++});
++
++describe("zipEligible (spec §7b)", () => {
++  it("photo かつ 2 枚以上かつ zipGalleries ON で true", () => {
++    expect(zipEligible(block(2), DEFAULT_SETTINGS)).toBe(true);
++  });
++  it("単発 photo は false(個別 DL の耐久性を優先)", () => {
++    expect(zipEligible(block(1), DEFAULT_SETTINGS)).toBe(false);
++  });
++  it("zipGalleries OFF / photo フィルタ OFF で false", () => {
++    expect(zipEligible(block(2), { ...DEFAULT_SETTINGS, zipGalleries: false })).toBe(false);
++    expect(zipEligible(block(2), { ...DEFAULT_SETTINGS, contentTypes: { ...DEFAULT_SETTINGS.contentTypes, photo: false } })).toBe(false);
++  });
++  it("file ブロックは false", () => {
++    expect(zipEligible({ ...block(2), contentType: "file" }, DEFAULT_SETTINGS)).toBe(false);
++  });
++});
++
++describe("collectZipSources (spec §7b バジェット)", () => {
++  // chunkSizes を順に流すモック。abort されたら以降のチャンクを出さない
++  const chunked = (chunkSizes: number[], status = 200) => {
++    const state = { aborted: false, yielded: 0 };
++    const resp = {
++      ok: status === 200, status,
++      async *chunks() {
++        for (const n of chunkSizes) {
++          if (state.aborted) return;
++          state.yielded += n;
++          yield new Uint8Array(n);
++        }
++      },
++      abort: () => { state.aborted = true; },
++    };
++    return { resp, state };
++  };
++  it("直列 fetch して buffers を返す", async () => {
++    const r = await collectZipSources(block(2).files, "1", { fetchFn: async () => chunked([10]).resp });
++    expect(r.ok).toBe(true);
++    if (r.ok) expect(r.buffers.size).toBe(2);
++  });
++  it("累積バイトが budget を超えた時点で abort して中止 error(読み切らない) (spec §7b)", async () => {
++    const states: Array<{ aborted: boolean; yielded: number }> = [];
++    const r = await collectZipSources(block(1).files, "1", {
++      fetchFn: async () => { const { resp, state } = chunked([60, 60, 60]); states.push(state); return resp; },
++      budget: 100,
++    });
++    expect(r.ok).toBe(false);
++    if (!r.ok) expect(r.error).toContain("上限");
++    // 2 チャンク目(累積 120 > 100)で中止し、3 チャンク目は受信していない
++    expect(states[0].yielded).toBe(120);
++    expect(states[0].aborted).toBe(true);
++  });
++  it("事前チェック: 既知サイズ合計が budget 超過なら 1 バイトも fetch せず error (spec §7b(a))", async () => {
++    let called = 0;
++    const files = block(2).files.map((f, i) => ({ ...f, size: 80 }));
++    const r = await collectZipSources(files, "1", { fetchFn: async () => { called++; return chunked([1]).resp; }, budget: 100 });
++    expect(r.ok).toBe(false);
++    expect(called).toBe(0);
++  });
++
++  it("件数上限超過は fetch せず即 error", async () => {
++    let called = 0;
++    const files = Array.from({ length: ZIP_MAX_FILES + 1 }, (_, i) => item(`f${i}`));
++    const r = await collectZipSources(files, "1", { fetchFn: async () => { called++; return chunked([1]).resp; } });
++    expect(r.ok).toBe(false);
++    expect(called).toBe(0);
++  });
++  it("allowlist 違反 URL は fetch せず error (spec §4a: zip ソース fetch も対象)", async () => {
++    const bad = { ...item("x"), url: "https://evil.example.com/images/post/1/x.jpg" };
++    const r = await collectZipSources([bad], "1", { fetchFn: async () => chunked([1]).resp });
++    expect(r.ok).toBe(false);
++  });
++  it("fetch 失敗(403 等)は error", async () => {
++    const r = await collectZipSources(block(2).files, "1", { fetchFn: async () => chunked([], 403).resp });
++    expect(r.ok).toBe(false);
++  });
++  it("既定 budget は 100MB", () => {
++    expect(ZIP_SOURCE_BUDGET_BYTES).toBe(100 * 1024 * 1024);
++  });
++});
++
++describe("buildZip (spec §7b 黙った欠落の禁止)", () => {
++  const post = {
++    postId: "1", postTitle: "T", creator: "C", creatorId: "s", fee: 0,
++    publishedAt: new Date("2026-07-01T00:00:00Z"), updatedAtIso: "", restricted: false,
++    postType: "image", skippedEmbeds: 0, contents: [],
++  } as any;
++  it("ソース buffer が欠けていたら throw(呼び出し側の個別 DL フォールバックに乗せる)", () => {
++    const b = block(2);
++    const buffers = new Map([[b.files[0].idemKey, new Uint8Array(1)]]); // 2 本目が欠落
++    expect(() => buildZip(post, b, buffers, DEFAULT_SETTINGS, new Date())).toThrow(/欠落/);
++  });
++  it("エントリ名衝突は ' (n)' 連番で回避される(静かな上書き禁止)", () => {
++    const b = block(2);
++    // $seq を含まないテンプレで両ファイルが同名になる状況を作る
++    const s = { ...DEFAULT_SETTINGS, zipEntryTemplate: "$filename.$ext" };
++    b.files = b.files.map((f) => ({ ...f, filename: "same" }));
++    const buffers = new Map(b.files.map((f) => [f.idemKey, new Uint8Array(1)]));
++    const { bytes } = buildZip(post, b, buffers, s, new Date());
++    // fantia-dl と同一の " (n)" 規則をエントリ名で直接検証する
++    const entries = Object.keys(unzipSync(bytes));
++    expect(entries.sort()).toEqual(["same (2).jpg", "same.jpg"]);
++  });
++});
++
++describe("handleZipDownloadChange (spec §7b 途中失敗の配達経路)", () => {
++  it("登録済み zip DL の interrupted は revoke + 必須文言の console ログ", async () => {
++    const revoked: string[] = [];
++    const logs: string[] = [];
++    const deps = { revoke: async (u: string) => { revoked.push(u); }, log: (m: string) => { logs.push(m); }, persist: async () => {} };
++    registerZipDownload(42, "blob:xyz", deps);
++    const handled = await handleZipDownloadChange({ id: 42, state: { current: "interrupted", previous: "in_progress" } } as any, deps);
++    expect(handled).toBe(true);
++    expect(revoked).toEqual(["blob:xyz"]);
++    expect(logs.some((m) => m.includes("zip は最初からやり直し"))).toBe(true);
++  });
++  it("complete は revoke のみでエラーログを出さない", async () => {
++    const revoked: string[] = [];
++    const logs: string[] = [];
++    const deps = { revoke: async (u: string) => { revoked.push(u); }, log: (m: string) => { logs.push(m); }, persist: async () => {} };
++    registerZipDownload(43, "blob:ok", deps);
++    const handled = await handleZipDownloadChange({ id: 43, state: { current: "complete", previous: "in_progress" } } as any, deps);
++    expect(handled).toBe(true);
++    expect(revoked).toEqual(["blob:ok"]);
++    expect(logs).toEqual([]);
++  });
++  it("未登録の downloadId は false(通常 DL の onChanged 処理へ)", async () => {
++    expect(await handleZipDownloadChange({ id: 999, state: { current: "complete", previous: "x" } } as any, { revoke: async () => {}, log: () => {}, persist: async () => {} })).toBe(false);
++  });
++});

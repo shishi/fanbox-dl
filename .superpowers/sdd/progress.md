@@ -14,3 +14,5 @@ Task 13: complete (commit 8fcef32, 128 tests, controller-inspected)
 Task 14: complete (commit 60630b8, 144 tests, review SPEC clean)
   Minor(最終レビュー triage): registerZipDownload の未使用 deps + finishZipDownload との zipDownloads.set 重複; handleZipDownloadChange doc-comment がブランケット契約(非 terminal delta で false)と字義不一致
 Task 15: complete (153 tests, typecheck 0, build: content/background/offscreen green, options entry pending Task 16, codex review native: options 依存の既知ギャップのみ)
+Task 15: complete (commit 481267a, 153 tests, SPEC ✅ Approved)
+  Minor(最終 triage): 起動時 reconcileZipDownloads が write-probe より先(storage.session のみ参照で実害なし)
