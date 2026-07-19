@@ -21,3 +21,7 @@ Final review: codex native 反復。round1(3件)/round2(3件・fail-closed final
   未解決(shishi 判断待ち):
   - P2 template-engine.ts:101 プレースホルダ値内 / の split(sanitize 前)→ サブフォルダ化/検証失敗。ただし core 無改造コピー制約(fantia-dl パリティ)と衝突。低exploitability(各セグメント sanitize + path-validator の traversal 拒否)
   - P3 options illegalCharReplacement に / \ を保存可(低リスク・自傷)
+Final review rounds 5-6: P2 tail(blocker 無し・P1/Critical は rounds 1-4 で全解決)。
+  未修正 triage:
+  - P2a orchestrator.ts fire-and-forget startDownload(retry_once/reconcile): MV3 SW suspend で稀に pending 取りこぼし。起動時 reconcile/次クリックで回復可(非 core・修正可)
+  - P2b template-engine.ts fmtDate が local-time getter → $date のタイムゾーン差でマシン間 relPath/dedup ズレ。**unmodified core(fantia-dl 由来)・core 無改造制約と衝突・shishi 判断**
