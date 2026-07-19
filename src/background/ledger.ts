@@ -1,4 +1,6 @@
 import { canonicalRelPath } from "../core/canonical-relpath";
+import { pathMatchesBoundary } from "./adoption";
+import type { FailureAction } from "./failure-classifier";
 
 // spec §7c-2: 単一キー(`jobs` storage key)に格納する ledger。
 // あらゆる状態遷移は「読む -> 純粋変換 -> 1 回 set」で行う(このモジュールは変換のみ)。
@@ -172,11 +174,213 @@ export function applyEnqueue(
   return { ...result, ledger: applyPruneSweep(result.ledger, opts.now, opts.caps ?? {}) };
 }
 
-// Task 9 時点の一時 stub(pass-through)。Task 10 が本実装(件数上限・sweep・tombstone)に
-// 置き換える。function 宣言なので applyEnqueue から前方参照できる。
-export function applyPruneSweep(
-  l: Ledger, _now: number,
-  _caps: { maxTerminal?: number; maxAgeMs?: number; maxTombstones?: number } = {},
+// --- CAS ヘルパ: leaseToken 不一致(旧世代の stale イベント)は ledger を変えずに返す ---
+function withCas(
+  l: Ledger, idemKey: string, leaseToken: string,
+  f: (rec: JobRecord) => JobRecord,
 ): Ledger {
-  return l;
+  const rec = l.jobs[idemKey];
+  if (!rec || rec.leaseToken !== leaseToken) return l; // stale イベント無視(spec §7c-2 CAS)
+  return { ...l, jobs: { ...l.jobs, [idemKey]: f(rec) } };
+}
+
+export function applyDownloadStarted(l: Ledger, idemKey: string, leaseToken: string, downloadId: number): Ledger {
+  return withCas(l, idemKey, leaseToken, (r) => ({ ...r, state: "requested", downloadId }));
+}
+
+export function applyDownloadRequestFailed(l: Ledger, idemKey: string, leaseToken: string, error: string, now?: number): Ledger {
+  const next = withCas(l, idemKey, leaseToken, (r) => ({ ...r, state: "error", error, terminalAt: now ?? r.leasedAt, leaseToken: undefined }));
+  if (next === l) return l;
+  // spec §7c-2: terminal レコードを作る遷移も同一ミューテーション内で prune
+  return applyPruneSweep(next, now ?? 0, {});
+}
+
+export function applyDownloadComplete(
+  l: Ledger, idemKey: string, leaseToken: string, actualFilename: string, doneAt: number,
+  caps: { maxTerminal?: number; maxAgeMs?: number; maxTombstones?: number } = {},
+): Ledger {
+  const next = withCas(l, idemKey, leaseToken, (r) => ({
+    ...r,
+    state: "done", doneAt, terminalAt: doneAt, actualFilename,
+    pathDivergent: pathMatchesBoundary(actualFilename, r.relPath) ? undefined : true,
+    lastDownloadedPostUpdatedAt: r.pendingPostUpdatedAt ?? r.lastDownloadedPostUpdatedAt,
+    leaseToken: undefined, leasedAt: undefined, retriedNetwork: undefined,
+  }));
+  if (next === l) return l; // CAS 不成立(stale)なら prune もしない
+  // spec §7c-2: terminal レコードの挿入と同一ミューテーション内 prune
+  return applyPruneSweep(next, doneAt, caps);
+}
+
+export function applyDownloadInterrupted(
+  l: Ledger, idemKey: string, leaseToken: string,
+  action: FailureAction, error: string,
+  newLeaseToken: () => string, now: number,
+  caps: { maxTerminal?: number; maxAgeMs?: number; maxTombstones?: number } = {},
+): Ledger {
+  const next = withCas(l, idemKey, leaseToken, (r) => {
+    if (action === "retry_once" && !r.retriedNetwork) {
+      // 有界リトライ 1 回(spec §6): 新 lease で pending に戻す
+      return { ...r, state: "pending", retriedNetwork: true, leaseToken: newLeaseToken(), leasedAt: now, downloadId: undefined, error };
+    }
+    if (action === "needs_page") {
+      return { ...r, state: "needs_page", error, terminalAt: now, leaseToken: undefined, leasedAt: undefined };
+    }
+    // SERVER_FORBIDDEN(有料 403)は spec §6 の明示文言でレコードに残す(raw code は併記)。
+    // refusedUrl も刻み、同一 URL の自動再投入(applyEnqueue の error 再投入分岐)を禁止する。
+    if (error === "SERVER_FORBIDDEN") {
+      return {
+        ...r, state: "error", terminalAt: now, refusedUrl: r.url,
+        error: "サーバがダウンロードを拒否しました(未加入の有料コンテンツの可能性)(SERVER_FORBIDDEN)",
+        leaseToken: undefined, leasedAt: undefined,
+      };
+    }
+    return { ...r, state: "error", error, terminalAt: now, leaseToken: undefined, leasedAt: undefined };
+  });
+  if (next === l) return l;
+  // spec §7c-2: terminal レコードを作る遷移も同一ミューテーション内で prune
+  const rec = next.jobs[idemKey];
+  return rec && (rec.state === "error" || rec.state === "needs_page") ? applyPruneSweep(next, now, caps) : next;
+}
+
+export function applyNeedsPageRecovery(
+  l: Ledger, postId: string,
+  fresh: Array<{ stableContentId: string; url: string; basePath: string }>,
+  opts: { now: number; postUpdatedAt: string; newLeaseToken: () => string; validatePath: (p: string) => string | null; invalidIds?: Set<string> },
+): { ledger: Ledger; toStart: JobRecord[]; missing: string[]; refused: string[]; invalid: string[]; errors: string[] } {
+  const jobs = { ...l.jobs };
+  const toStart: JobRecord[] = [];
+  const missing: string[] = [];
+  const refused: string[] = [];
+  const invalid: string[] = [];
+  const errors: string[] = [];
+  const byId = new Map(fresh.map((f) => [f.stableContentId, f]));
+  for (const rec of Object.values(l.jobs)) {
+    if (rec.postId !== postId || rec.state !== "needs_page") continue;
+    if (opts.invalidIds?.has(rec.stableContentId)) {
+      // spec §4a: allowlist 違反は「編集で消えた」と区別して明示 error にする
+      jobs[rec.idemKey] = { ...rec, state: "error", terminalAt: opts.now, error: "メディア URL が許可外のためダウンロードできません" };
+      invalid.push(rec.idemKey);
+      continue;
+    }
+    const f = byId.get(rec.stableContentId); // 安定 ID 一致のみ(ordinal 誤バインド禁止 spec §6)
+    if (!f) {
+      jobs[rec.idemKey] = { ...rec, state: "error", terminalAt: opts.now, error: "投稿が編集され該当ファイルは存在しない" };
+      missing.push(rec.idemKey);
+      continue;
+    }
+    if (f.url === rec.url) {
+      // URL が変わっていない = 編集由来の失効ではない。再投入しても同じサーバ失敗を
+      // 繰り返すだけなので中立の明示 terminal error にする(spec §6)。
+      // refusedUrl を刻み、後続 applyEnqueue の error 再投入分岐がこの URL を
+      // 自動再投入することも禁止する(拒否が同クリックで巻き戻る矛盾の防止)。
+      jobs[rec.idemKey] = { ...rec, state: "error", terminalAt: opts.now, refusedUrl: rec.url, error: "同じ URL のままサーバ側の失敗が続いています。時間を置いて再試行してください" };
+      refused.push(rec.idemKey);
+      continue;
+    }
+    // 世代交代の canonical パス規則は回復経路にも適用(spec §7c-2「世代交代全般」)
+    const { generation: gen, relPath } = nextGenerationPath(f.basePath, rec.generation, rec.relPath);
+    const err = opts.validatePath(relPath);
+    if (err) {
+      // パス検証エラーは「編集で消えた」とは別種の失敗として errors に整形済み文言で積む
+      jobs[rec.idemKey] = { ...rec, state: "error", terminalAt: opts.now, error: `${relPath}: ${err}` };
+      errors.push(`${rec.idemKey}: パス検証エラー ${relPath}: ${err}`);
+      continue;
+    }
+    const next: JobRecord = {
+      ...rec, state: "pending", url: f.url, relPath, generation: gen,
+      leaseToken: opts.newLeaseToken(), leasedAt: opts.now, downloadId: undefined,
+      pendingPostUpdatedAt: opts.postUpdatedAt,
+      supersededUrl: rec.url, supersededAt: opts.now, error: undefined, retriedNetwork: undefined,
+      terminalAt: undefined, refusedUrl: undefined,
+    };
+    jobs[rec.idemKey] = next;
+    toStart.push(next);
+  }
+  // spec §7c-2: 回復も terminal(error)レコードを作り得るため同一ミューテーション内で prune
+  const pruned = applyPruneSweep({ ...l, jobs }, opts.now, {});
+  return { ledger: pruned, toStart, missing, refused, invalid, errors };
+}
+
+const TERMINAL_STATES: ReadonlySet<JobState> = new Set(["done", "error", "needs_page"]);
+
+function tombstoneInto(generations: Record<string, number>, rec: JobRecord): void {
+  if (rec.generation > 0) {
+    generations[rec.idemKey] = Math.max(generations[rec.idemKey] ?? 0, rec.generation);
+  }
+}
+
+function capTombstones(generations: Record<string, number>, max: number): Record<string, number> {
+  const keys = Object.keys(generations);
+  if (keys.length <= max) return generations;
+  // 挿入順の古い方から削除(Object のキー順 = 挿入順)。喪失時の最悪ケースは
+  // divergent 回復チェーンで収束する(spec §7c-2)。
+  const out: Record<string, number> = {};
+  for (const k of keys.slice(keys.length - max)) out[k] = generations[k];
+  return out;
+}
+
+export function applyClearTerminal(l: Ledger): Ledger {
+  const jobs: Record<string, JobRecord> = {};
+  const generations = { ...l.generations };
+  for (const rec of Object.values(l.jobs)) {
+    if (TERMINAL_STATES.has(rec.state)) tombstoneInto(generations, rec);
+    else jobs[rec.idemKey] = rec; // 進行中は terminal になるまで残す(spec §7c-3)
+  }
+  return { jobs, generations: capTombstones(generations, 10_000) };
+}
+
+export function applyPruneSweep(
+  l: Ledger, now: number,
+  caps: { maxTerminal?: number; maxAgeMs?: number; maxTombstones?: number } = {},
+): Ledger {
+  const maxTerminal = caps.maxTerminal ?? 5_000;
+  const maxAgeMs = caps.maxAgeMs ?? 365 * 24 * 3600 * 1000;
+  const maxTombstones = caps.maxTombstones ?? 10_000;
+  const jobs = { ...l.jobs };
+  const generations = { ...l.generations };
+  const drop = (rec: JobRecord) => { tombstoneInto(generations, rec); delete jobs[rec.idemKey]; };
+
+  const terminalTime = (r: JobRecord) => r.terminalAt ?? r.doneAt ?? r.leasedAt ?? 0;
+  for (const rec of Object.values(l.jobs)) {
+    // spec §7c-2: sweep は done に限らず全 terminal(古い error/needs_page も掃除できる)
+    if (TERMINAL_STATES.has(rec.state) && now - terminalTime(rec) > maxAgeMs) drop(rec);
+  }
+  const terminals = Object.values(jobs)
+    .filter((r) => TERMINAL_STATES.has(r.state))
+    .sort((a, b) => terminalTime(a) - terminalTime(b));
+  for (let i = 0; i < terminals.length - maxTerminal; i++) drop(terminals[i]);
+
+  return { jobs, generations: capTombstones(generations, maxTombstones) };
+}
+
+export function findLeasesWithoutDownloadId(l: Ledger): JobRecord[] {
+  return Object.values(l.jobs).filter((r) => r.state === "pending" && r.leaseToken !== undefined && r.downloadId === undefined);
+}
+
+// spec §4a: allowlist 違反 ID の既存ジョブを error 化する(needs_page 回復以外の経路)
+export function applyInvalidateByIds(
+  l: Ledger, postId: string, invalidIds: Set<string>, now: number,
+): { ledger: Ledger; invalidated: string[] } {
+  if (invalidIds.size === 0) return { ledger: l, invalidated: [] };
+  const jobs = { ...l.jobs };
+  const invalidated: string[] = [];
+  for (const rec of Object.values(l.jobs)) {
+    if (rec.postId !== postId || !invalidIds.has(rec.stableContentId)) continue;
+    if (rec.state === "pending" || rec.state === "requested" || rec.state === "needs_page") {
+      jobs[rec.idemKey] = { ...rec, state: "error", terminalAt: now, leaseToken: undefined, leasedAt: undefined, error: "メディア URL が許可外のためダウンロードできません" };
+      invalidated.push(rec.idemKey);
+    }
+  }
+  return { ledger: applyPruneSweep({ ...l, jobs }, now, {}), invalidated };
+}
+
+// spec §7c-2: requeue のたびに leaseToken を再発行する(旧 lease の遅延解決が
+// 新試行を汚染しないための CAS 前提)。reconcile の再投入はここを必ず通す。
+export function applyReissueLease(
+  l: Ledger, idemKey: string, oldToken: string, newToken: string, now: number,
+): { ledger: Ledger; record: JobRecord | null } {
+  const rec = l.jobs[idemKey];
+  if (!rec || rec.leaseToken !== oldToken) return { ledger: l, record: null };
+  const next: JobRecord = { ...rec, state: "pending", leaseToken: newToken, leasedAt: now, downloadId: undefined };
+  return { ledger: { ...l, jobs: { ...l.jobs, [idemKey]: next } }, record: next };
 }
