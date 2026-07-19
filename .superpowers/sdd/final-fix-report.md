@@ -392,3 +392,90 @@ core(src/core/*)無変更確認: `git diff --stat 7865aaa..HEAD -- src/core` は
   Chrome offscreen document / `chrome.runtime.sendMessage` を使った統合的な手動確認は
   行っていない(依頼文の「offscreen 実体はテスト困難なので…難しければ手動確認で可」の
   代替として deps 注入テストを選択したため)。
+
+## 最終レビュー round5 P2 (3件) 修正 — needs_page 回復の zip/設定尊重 + zip entryPath 実行時検証
+
+対象コミット: dac7c00 (branch: impl/mvp)
+
+### 修正内容
+
+**P2a/P2b (orchestrator.ts): needs_page 回復が現在の zip/contentType 判断を尊重する**
+
+- `handleDownloadRequest` の needs_page 回復ステップで使う `fresh` を、
+  「zipEligible(block, settings) が false」かつ「s.contentTypes[file.contentType] が有効」な
+  ファイルだけに限定した。zip 予定ブロックのファイルと、無効化された contentType の
+  ファイルは `excludedStableIds` として除外する。
+- core の `applyNeedsPageRecovery` は「fresh に無い stableContentId = 投稿編集で消えた」と
+  解釈して missing/error に倒すため、除外分の既存 needs_page レコードは commit 前に
+  スナップショットを取っておき、commit 後に元の状態(needs_page のまま)へ復元する
+  (core 無改造で「回復しない」を実現)。
+- codex レビューでの追加指摘(反復 1 回目・P2): zip 予定は静的な設定判定にすぎず、
+  実行時に collect/build/downloadViaOffscreen が失敗して個別 DL にフォールバックする
+  ケースがある。フォールバック時に据え置いた needs_page レコードをそのまま
+  candidates ループに流すと、core の正規の回復ロジック(同一 URL は拒否 / URL 変更は
+  世代交代)を経ないまま applyEnqueue の「非回復 needs_page 再クリック」分岐
+  (同世代・無条件再投入)に落ちてしまい、拒否済み URLの黙った再試行や、世代が
+  上がらないままの再投入を招くことが分かった。ブロックループ側で実際に zip が
+  不成立だったブロックに限り、その場で block スコープの `applyNeedsPageRecovery` を
+  もう一度掛け直すことで解決した。
+- codex レビューでの追加指摘(反復 2 回目・P1/P2): この block スコープの再回復呼び出しは
+  `applyNeedsPageRecovery` が postId 全体の needs_page を走査する性質上、
+  まだ処理順が回ってきていない他ブロック(他の zip 予定ブロックや contentType 無効化分)の
+  据え置き中レコードまで missing 化してしまう不具合と、basePath の renderTemplate 呼び出しが
+  TemplateError を素通しして throw する回帰があった。前者は phase 1 と同じ
+  「復元スナップショット」パターンをブロックスコープでも適用し、後者は後段の候補ループと
+  同じ try/catch(テンプレートエラー応答 + finish())に統一して解消した。
+
+**P2c (zip.ts): buildZip の entryPath 実行時検証**
+
+- `buildZip` で各ファイルの entryPath(衝突回避の連番付与後)に対し、zipPath と同じ
+  `validatePath` を適用し、不正(先頭 `/`、`..` セグメント、パス長超過等)なら
+  fail-closed で throw するようにした(呼び出し側 `handleDownloadRequest` の
+  zip build try/catch が個別 DL フォールバックに乗せる)。
+- codex レビューでの指摘: zip 内部のエントリ名は chrome.downloads の uniquify
+  サフィックス対象ではない(実ファイルシステムパスではない)ため、
+  `conflictAction: CONFLICT_ACTION`(= "uniquify")を渡すと `uniquifyHeadroom`
+  (既定 16)が誤って差し引かれ、実際には収まる長さの entry まで誤検知で拒否する
+  regression になっていた(再現テストで確認)。`conflictAction: "overwrite"` を渡すことで
+  headroom を差し引かず、トラバーサル系のチェック(先頭 `/`、`..` セグメント等)は
+  そのまま有効にした。
+
+### テスト(TDD: 全て RED 確認後に実装 → GREEN)
+
+- `tests/orchestrator.test.ts`
+  - 「zip 予定ギャラリーに needs_page があっても回復で個別 DL は始まらず zip 1 本だけになる」
+  - 「video を無効化した後は video の needs_page が回復再開されない」
+  - 「zip 予定だが実際には zip 化に失敗して個別 DL にフォールバックする場合、changed-URL の
+    needs_page は generation を上げて正しく回復する」(codex 指摘の再現 → 修正確認)
+  - 「zip 予定だが実際には zip 化に失敗して個別 DL にフォールバックする場合、same-URL の
+    needs_page は再試行されず明示 error になる」(codex 指摘の再現 → 修正確認)
+  - 「複数ブロックの投稿で、あるブロックの zip フォールバック回復が他ブロックの据え置き
+    needs_page を誤って missing 化しない」(codex 指摘の再現 → 修正確認)
+- `tests/zip.test.ts`
+  - 「entryPath が ../ を含むと buildZip が throw する」
+    (renderTemplate は通常経路では `../` を無害化するため、zipEntryTemplate 呼び出しだけを
+    狙った vi.mock マーカーテンプレで実行時検証層を独立にテストした)
+  - 「entryPath の実行時検証はダウンロードパスの uniquify headroom を誤って流用しない」
+    (codex 指摘の再現 → 修正確認)
+
+追加テスト数: 7件(orchestrator.test.ts 5件、zip.test.ts 2件)
+
+### 検証
+
+- `bun run test`: 194 tests / 20 files すべて green
+- typecheck: 0 エラー
+- build: 成功(service-worker.js 78.0kb ほか全 4 バンドル生成)
+- `git diff --stat 7865aaa..HEAD -- src/core`: 8 ファイル・323 insertions・0 deletions
+  (このセッションでの core 変更なし)
+
+### レビューゲート
+
+codex-review skill(native mode, `--uncommitted`)を 3 反復:
+1. 初回: P2(zip entryPath の uniquify headroom 誤流用)を指摘 → 修正
+2. 2回目: P1(block スコープ回復の他ブロック巻き添え)+ P2(renderTemplate throw の
+   素通し)を指摘 → 修正
+3. 3回目: "did not identify a concrete regression" — clean
+
+### 懸念・残課題
+
+- なし(codex レビュー3反復目で clean 判定)。
