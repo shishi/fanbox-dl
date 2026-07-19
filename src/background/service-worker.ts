@@ -34,7 +34,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg?.kind === "clearHistory") {
-    store.commit((l) => ({ ledger: applyClearTerminal(l), result: null }))
+    store.commit((l) => ({ ledger: applyClearTerminal(l, Date.now()), result: null }))
       .then(() => { store.failClosed = false; sendResponse({ ok: true }); })
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;

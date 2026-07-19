@@ -207,23 +207,46 @@ describe("clear / prune / tombstone (spec §7c-2/§7c-3)", () => {
     expect(done.jobs["k1"]).toBeUndefined();
     expect(done.jobs["111:image:a"].state).toBe("done");
   });
-  it("clearTerminal は terminal のみ削除し、進行中を残し、gen>0 は tombstone 化", () => {
+  it("clearTerminal は terminal のみ削除し、downloadId 付きの進行中(live DL)を残し、gen>0 は tombstone 化", () => {
     const { l, token } = enq();
     const done = applyDownloadComplete(applyDownloadStarted(l, "111:image:a", token, 1), "111:image:a", token, "/dl/fanbox/s/T/a.jpeg", 1);
-    // 2 本目: 進行中のまま
-    const both = applyEnqueue(done, [{ ...cand(), idemKey: "111:image:b", stableContentId: "image:b", url: "https://downloads.fanbox.cc/images/post/111/b.jpeg", basePath: "fanbox/s/T/b.jpeg" }], baseOpts).ledger;
+    // 2 本目: downloadId 付きで進行中(browser 側に実体のある live DL なので孤児化を避けて残す必要がある)
+    const enqueuedB = applyEnqueue(done, [{ ...cand(), idemKey: "111:image:b", stableContentId: "image:b", url: "https://downloads.fanbox.cc/images/post/111/b.jpeg", basePath: "fanbox/s/T/b.jpeg" }], baseOpts);
+    const both = applyDownloadStarted(enqueuedB.ledger, "111:image:b", enqueuedB.toStart[0].leaseToken!, 7);
     const gen1: Ledger = { ...both, jobs: { ...both.jobs, "111:image:a": { ...both.jobs["111:image:a"], generation: 2 } } };
-    const cleared = applyClearTerminal(gen1);
+    const cleared = applyClearTerminal(gen1, 999_999);
     expect(cleared.jobs["111:image:a"]).toBeUndefined();
-    expect(cleared.jobs["111:image:b"]).toBeDefined(); // 進行中は残す
+    expect(cleared.jobs["111:image:b"]).toBeDefined(); // downloadId 有りの進行中は残す
+    expect(cleared.jobs["111:image:b"].state).toBe("requested");
     expect(cleared.generations["111:image:a"]).toBe(2); // tombstone
   });
-  it("lease 窓中の clear: 未解決 lease(pending)のレコードは削除されない (spec §7c-3 必須テスト)", () => {
-    const { l } = enq(); // pending + lease(downloadId 未永続 = lease 窓)
-    const cleared = applyClearTerminal(l);
+  it("clearTerminal: 猶予期間(10s)を過ぎても downloadId 無しの pending(lease-only 残骸)は削除される (spec §7c-3 修正: stale nonterminal 復旧・必須テスト)", () => {
+    const { l } = enq(); // pending + lease(leasedAt=10_000, downloadId 未永続 = browser 側に実体の無い lease-only 残骸)
+    const cleared = applyClearTerminal(l, 25_000); // 経過 15s > 猶予 10s
+    expect(cleared.jobs["111:image:a"]).toBeUndefined();
+    expect(cleared.generations["111:image:a"]).toBeUndefined(); // gen 0 は tombstone 化しない
+  });
+  it("clearTerminal: 猶予期間内は downloadId 無しの pending でも削除しない (codex レビュー指摘: download() がキュー外の非同期空白から呼ばれる競合窓の保護)", () => {
+    const { l } = enq(); // pending + lease(leasedAt=10_000)。download() 呼び出し自体はまだ解決していないだけかもしれない
+    const cleared = applyClearTerminal(l, 15_000); // 経過 5s < 猶予 10s
     expect(cleared.jobs["111:image:a"]).toBeDefined();
     expect(cleared.jobs["111:image:a"].state).toBe("pending");
-    expect(cleared.jobs["111:image:a"].leaseToken).toBeTruthy(); // lease はそのまま
+    expect(cleared.jobs["111:image:a"].leaseToken).toBeTruthy();
+  });
+  it("clearTerminal: downloadId 無しの pending は猶予期間経過後なら gen>0 でも削除され tombstone 化される", () => {
+    const { l } = enq();
+    const gen1: Ledger = { ...l, jobs: { ...l.jobs, "111:image:a": { ...l.jobs["111:image:a"], generation: 2 } } };
+    const cleared = applyClearTerminal(gen1, 25_000);
+    expect(cleared.jobs["111:image:a"]).toBeUndefined();
+    expect(cleared.generations["111:image:a"]).toBe(2);
+  });
+  it("clearTerminal: downloadId 有りの requested(browser に実体のある live DL)は猶予期間経過後も削除されない (spec §7c-3 必須テスト)", () => {
+    const { l, token } = enq();
+    const started = applyDownloadStarted(l, "111:image:a", token, 1);
+    const cleared = applyClearTerminal(started, 999_999);
+    expect(cleared.jobs["111:image:a"]).toBeDefined();
+    expect(cleared.jobs["111:image:a"].state).toBe("requested");
+    expect(cleared.jobs["111:image:a"].downloadId).toBe(1);
   });
 
   it("pruneSweep: 1 年超の done を削除・terminal 上限で古い順に prune", () => {
@@ -251,7 +274,7 @@ describe("clear / prune / tombstone (spec §7c-2/§7c-3)", () => {
     const { l, token } = enq();
     const done = applyDownloadComplete(applyDownloadStarted(l, "111:image:a", token, 1), "111:image:a", token, "/dl/fanbox/s/T/a.jpeg", 1);
     const gen2: Ledger = { ...done, jobs: { ...done.jobs, "111:image:a": { ...done.jobs["111:image:a"], generation: 2 } } };
-    let cleared = applyClearTerminal(gen2);
+    let cleared = applyClearTerminal(gen2, 999_999);
     expect(cleared.generations["111:image:a"]).toBe(2);
     // 後から入った別 tombstone で cap を溢れさせる(挿入順の古い方 = image:a が消える)
     cleared = { ...cleared, generations: { ...cleared.generations, "999:image:z": 1 } };

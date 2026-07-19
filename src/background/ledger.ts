@@ -318,12 +318,31 @@ function capTombstones(generations: Record<string, number>, max: number): Record
   return out;
 }
 
-export function applyClearTerminal(l: Ledger): Ledger {
+// download() はキューの外(非同期の空白期間)から呼ばれる契約(spec §7c-2 デッドロック
+// 防止)なので、lease されたばかりの pending は「まだ downloadId が付いていないだけで
+// browser 側の download() 呼び出し自体は進行中」の可能性がある(codex レビュー指摘:
+// downloadId === undefined だけで判定すると、この競合窓で生きた DL を孤児化しうる)。
+// 猶予期間(既存の bounded-wait と同じ 10s 目安 spec settle.ts)を過ぎてもなお
+// downloadId が付かない場合のみ、SW クラッシュ等で本当に停止した lease-only 残骸と
+// みなして削除する。
+const STALE_LEASE_GRACE_MS = 10_000;
+
+export function applyClearTerminal(l: Ledger, now: number): Ledger {
   const jobs: Record<string, JobRecord> = {};
   const generations = { ...l.generations };
   for (const rec of Object.values(l.jobs)) {
-    if (TERMINAL_STATES.has(rec.state)) tombstoneInto(generations, rec);
-    else jobs[rec.idemKey] = rec; // 進行中は terminal になるまで残す(spec §7c-3)
+    if (TERMINAL_STATES.has(rec.state)) {
+      tombstoneInto(generations, rec);
+    } else if (rec.downloadId === undefined && now - (rec.leasedAt ?? now) > STALE_LEASE_GRACE_MS) {
+      // 猶予期間を過ぎても downloadId が永続化されない = browser 側に実体の無い
+      // stale な lease-only 残骸(SW クラッシュ等)。孤児化する実体が無いので、
+      // 履歴クリアで一緒に削除してよい(修正: 履歴クリアで復旧できない stale nonterminal)。
+      tombstoneInto(generations, rec);
+    } else {
+      // 猶予期間内(download() 呼び出しがまだ解決していない可能性がある)、または
+      // downloadId を持つ進行中(live DL)は孤児化を避けて残す(spec §7c-3)。
+      jobs[rec.idemKey] = rec;
+    }
   }
   return { jobs, generations: capTombstones(generations, 10_000) };
 }

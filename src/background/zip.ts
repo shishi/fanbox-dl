@@ -5,7 +5,7 @@ import { validateMediaUrl } from "../core/url-allowlist";
 import { CONFLICT_ACTION } from "../core/settings";
 import { buildRenderContext, buildZipRenderContext } from "./render-adapter";
 import { OFFSCREEN_TARGET } from "../offscreen/protocol";
-import type { OffscreenChunkMessage, OffscreenDoneMessage, OffscreenRevokeMessage, OffscreenResult } from "../offscreen/protocol";
+import type { OffscreenAbortMessage, OffscreenChunkMessage, OffscreenDoneMessage, OffscreenRevokeMessage, OffscreenResult } from "../offscreen/protocol";
 import type { ContentBlock, PostData, Settings } from "../core/types";
 
 // spec §7b: 事前チェックと実行時バジェットは同一の名前付き定数を参照する
@@ -158,6 +158,14 @@ function sendChunkToOffscreen(jobId: string, base64: string): Promise<unknown> {
   } satisfies OffscreenChunkMessage);
 }
 
+// content-script 側と同じ役目: zipDone に届く前に送信ループが失敗した場合、
+// offscreen document の accumulators に溜まったチャンクを破棄させる(spec §7b: リーク防止)。
+function sendZipAbort(jobId: string): Promise<unknown> {
+  return chrome.runtime.sendMessage({
+    target: OFFSCREEN_TARGET, kind: "zipAbort", jobId,
+  } satisfies OffscreenAbortMessage).catch(() => {});
+}
+
 interface ZipPortResult {
   queued: number;
   error?: string;
@@ -190,14 +198,38 @@ function revokeOffscreenUrl(url: string): Promise<unknown> {
   } satisfies OffscreenRevokeMessage).catch(() => {});
 }
 
-export async function downloadZipViaOffscreen(zipPath: string, bytes: Uint8Array): Promise<{ ok: boolean; error?: string }> {
-  await ensureOffscreenDocument();
+// downloadZipViaOffscreen のテストのための注入点。既定は実 chrome API を使う実装。
+export interface ZipOffscreenDeps {
+  ensureOffscreen(): Promise<void>;
+  sendChunk(jobId: string, base64: string): Promise<unknown>;
+  finish(jobId: string, filename: string): Promise<ZipPortResult>;
+  abort(jobId: string): Promise<unknown>;
+}
+
+const defaultZipOffscreenDeps: ZipOffscreenDeps = {
+  ensureOffscreen: ensureOffscreenDocument,
+  sendChunk: sendChunkToOffscreen,
+  finish: finishZipDownload,
+  abort: sendZipAbort,
+};
+
+export async function downloadZipViaOffscreen(
+  zipPath: string, bytes: Uint8Array, deps: ZipOffscreenDeps = defaultZipOffscreenDeps,
+): Promise<{ ok: boolean; error?: string }> {
+  await deps.ensureOffscreen();
   const jobId = crypto.randomUUID();
-  for (let off = 0; off < bytes.byteLength; off += ZIP_CHUNK_BYTES) {
-    await sendChunkToOffscreen(jobId, bytesToBase64(bytes.subarray(off, Math.min(off + ZIP_CHUNK_BYTES, bytes.byteLength))));
+  try {
+    for (let off = 0; off < bytes.byteLength; off += ZIP_CHUNK_BYTES) {
+      await deps.sendChunk(jobId, bytesToBase64(bytes.subarray(off, Math.min(off + ZIP_CHUNK_BYTES, bytes.byteLength))));
+    }
+    const res = await deps.finish(jobId, zipPath);
+    return res.queued === 1 ? { ok: true } : { ok: false, error: res.error };
+  } catch (e) {
+    // zipDone(finish)まで届かなかった=offscreen の accumulators に蓄積が居座ったままになるため、
+    // zipAbort で破棄させてからエラーを返す(spec §7b: 途中失敗での offscreen リーク防止)。
+    await deps.abort(jobId);
+    return { ok: false, error: String(e) };
   }
-  const res = await finishZipDownload(jobId, zipPath);
-  return res.queued === 1 ? { ok: true } : { ok: false, error: res.error };
 }
 
 // --- handleZipDownloadChange と registerZipDownload の deps 注入インタフェース ---

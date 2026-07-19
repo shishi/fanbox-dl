@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { unzipSync } from "fflate";
-import { zipEligible, collectZipSources, buildZip, ZIP_SOURCE_BUDGET_BYTES, ZIP_MAX_FILES, registerZipDownload, handleZipDownloadChange } from "../src/background/zip";
+import { zipEligible, collectZipSources, buildZip, ZIP_SOURCE_BUDGET_BYTES, ZIP_MAX_FILES, registerZipDownload, handleZipDownloadChange, downloadZipViaOffscreen } from "../src/background/zip";
 import { DEFAULT_SETTINGS } from "../src/core/settings";
 import type { ContentBlock, FileItem } from "../src/core/types";
 
@@ -140,5 +140,50 @@ describe("handleZipDownloadChange (spec §7b 途中失敗の配達経路)", () =
   });
   it("未登録の downloadId は false(通常 DL の onChanged 処理へ)", async () => {
     expect(await handleZipDownloadChange({ id: 999, state: { current: "complete", previous: "x" } } as any, { revoke: async () => {}, log: () => {}, persist: async () => {} })).toBe(false);
+  });
+});
+
+describe("downloadZipViaOffscreen (spec §7b offscreen accumulator リーク修正)", () => {
+  it("チャンク送信が zipDone 前に失敗したら offscreen へ zipAbort を送って蓄積を破棄してから error を返す", async () => {
+    const aborted: string[] = [];
+    let finishCalled = false;
+    const deps = {
+      ensureOffscreen: async () => {},
+      sendChunk: async () => { throw new Error("chunk send failed"); },
+      finish: async () => { finishCalled = true; return { queued: 1 }; },
+      abort: async (jobId: string) => { aborted.push(jobId); },
+    };
+    const res = await downloadZipViaOffscreen("out.zip", new Uint8Array(10), deps);
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("chunk send failed");
+    expect(aborted).toHaveLength(1);
+    expect(finishCalled).toBe(false); // zipDone(finish)には到達していない
+  });
+
+  it("finish(zipDone)自体が失敗しても offscreen へ zipAbort を送って error を返す", async () => {
+    const aborted: string[] = [];
+    const deps = {
+      ensureOffscreen: async () => {},
+      sendChunk: async () => {},
+      finish: async () => { throw new Error("zipDone unreachable"); },
+      abort: async (jobId: string) => { aborted.push(jobId); },
+    };
+    const res = await downloadZipViaOffscreen("out.zip", new Uint8Array(10), deps);
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("zipDone unreachable");
+    expect(aborted).toHaveLength(1);
+  });
+
+  it("正常系では zipAbort を送らない", async () => {
+    const aborted: string[] = [];
+    const deps = {
+      ensureOffscreen: async () => {},
+      sendChunk: async () => {},
+      finish: async () => ({ queued: 1 }),
+      abort: async (jobId: string) => { aborted.push(jobId); },
+    };
+    const res = await downloadZipViaOffscreen("out.zip", new Uint8Array(10), deps);
+    expect(res.ok).toBe(true);
+    expect(aborted).toHaveLength(0);
   });
 });
