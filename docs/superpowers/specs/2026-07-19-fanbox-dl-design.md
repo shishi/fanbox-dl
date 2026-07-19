@@ -33,11 +33,10 @@ fantia-dl と同一の Manifest V3・5 モジュール分離。
 
 | モジュール | 責務 | fantia-dl からの変更 |
 |---|---|---|
-| content script | DL ボタン注入 / postId 抽出 / MAIN-world page script 注入 → bridge 受領 | URL パターンと postId 抽出のみ変更。CSRF 抽出は**削除** |
-| page script (MAIN world) | 実ページ文脈で `post.info` を fetch | CSRF ヘッダ不要になり簡素化。URL resolver は**廃止**(§7a) |
-| background (service worker) | ジョブ永続化 / テンプレ展開 / 検証 / `chrome.downloads` 実行 | URL 再解決ロジック削除で簡素化 |
+| content script | DL ボタン注入 / postId 抽出 / background へ DL 依頼 | URL パターンと postId 抽出のみ変更。CSRF 抽出と **page script 注入機構は削除**(§4a) |
+| background (service worker) | **`post.info` の canonical fetch(§4a)** / ジョブ永続化 / テンプレ展開 / 検証 / **DL URL の allowlist 検証** / `chrome.downloads` 実行 | URL 再解決ロジック削除。API fetch と allowlist 検証が加わる |
 | core(template-engine / sanitizer / path-validator / settings / base64) | 純粋関数群 | **無改造でコピー**(テストごと流用) |
-| offscreen + fflate | zip モードの blob 生成 | 無改造でコピー |
+| offscreen + fflate | zip モードの blob 生成・zip 用バイナリ取得 | zip 生成は無改造。**バイナリ取得経路は再設計**(§7b) |
 
 - データソースは Fanbox 公式 JSON API(`https://api.fanbox.cc/post.info?postId={id}`)。
   DOM スクレイピングはフォールバックにも使わない(API が全情報を持つことを PoC で確認済み)。
@@ -78,7 +77,44 @@ fantia-dl と同一の Manifest V3・5 モジュール分離。
 
 ### 未実測(MVP マイルストーン1の hard gate、§13)
 - **有料投稿のファイル URL に cookie が必須か**は未実測(PoC 時点で有料プラン未加入のため)。
-  §7a のフォールバック設計で吸収する。
+  §7a のフォールバック方針で吸収する。
+- **extension-context(background)からの `post.info` fetch が 200 になるか**は未実測
+  (PoC はページ文脈のみ)。§13-6 の hard gate で実証する。失敗時はフェイルクローズ(§4a)。
+
+## 4a. post.info 取得経路と信頼境界(normative)
+
+fantia-dl は CSRF トークンの都合で MAIN-world page script が canonical だったが、
+Fanbox は cookie のみで認証できるため、**信頼境界のより強い経路を canonical にする**。
+
+- **canonical**: background(service worker)が `fetch("https://api.fanbox.cc/post.info?postId=...",
+  {credentials: "include"})` を実行する。`host_permissions` により CORS 免除。
+  MAIN-world bridge を経由しないため、ページ側 JS が偽レスポンスを注入する余地がない。
+  cookie の SameSite 挙動が未実測のため **MVP1 hard gate(§13)で実証**する。
+- **フェイルクローズ(normative)**: background fetch が失敗する環境では拡張は
+  「post.info を取得できない」ことを明示エラーにして**停止する**。MAIN-world page script +
+  postMessage bridge(ページ文脈 fetch は PoC で 200 実証済み)は技術的な代替経路として
+  存在するが、bridge 応答はページ世界由来の信頼できないデータであり、フィルタしても
+  post.title / user.name / item id 等のメタデータが filename・idemKey・DL 履歴という
+  永続状態に流れ込む(偽装による履歴汚染・偽 dedup を allowlist では防げない)。
+  そのため**本 spec の normative 設計には含めない**。gate(§13-6)で background fetch が
+  不成立と判明した場合に備え、**degraded モードの契約**だけを先に固定しておく:
+  bridge 経路で得たデータは (a) 永続 ledger(`jobs`)へ一切書かない(dedup・resume・
+  needs_page 無効)、(b) allowlist 検証(§4a)は同一に適用、(c) UI に「検証不能なページ由来
+  データで動作中(履歴無効)」の常時バナーを出す、(d) セッション内(メモリ)限りの重複防止のみ
+  行う。この契約を満たす実装として spec 改訂を経てから出荷する。
+- **どちらの経路でも normative な防御(SW 側で実施)**:
+  1. レスポンス schema 検証: `body.post.id` が要求 postId と一致すること、type / body 構造が
+     既知の形であること。不一致は enqueue せず明示エラー。
+  2. **メディア URL の allowlist(全ネットワーク使用前・normative)**: parse 層が受け取った
+     すべてのメディア URL は、**いかなるネットワーク使用よりも前に**(通常 DL の
+     `downloads.download`、zip 用ソース fetch(§7b)、`needs_page` 回復の再解決を含む全経路)
+     次の条件で検証する:
+     - host が `downloads.fanbox.cc` であること(将来ホストが増えたら allowlist を明示更新)
+     - path が `/images/post/{postId}/...` または `/files/post/{postId}/...` の形で、
+       `{postId}` が当該ジョブの postId と一致すること
+     違反はジョブを enqueue せず(既存ジョブなら error にして)明示通知する。
+     confused deputy(拡張権限・拡張 cookie 文脈での任意 URL fetch/DL)を防ぐ。
+     検証は純粋関数として実装し単体テストを必須とする。
 
 ## 5. プレースホルダ・カタログ(fantia-dl との差分)
 
@@ -94,7 +130,7 @@ context の組み立て(background)で以下のようにマッピングする。
 | `$date{fmt}` | `post.publishedDatetime` |
 | `$today{fmt}` | 実行日(変更なし) |
 | `$contentTitle` | **常に null**(Fanbox にコンテンツブロック題名が無い。`[...]` で自然に消える) |
-| `$contentId` | image/file item の `id`(article は block 由来の imageId/fileId) |
+| `$contentId` | image/file item の `id`(article は imageId/fileId と同値。idemKey / refetch の主キーでもある §6) |
 | `$contentType` | photo / file / video(§6 のマッピング) |
 | `$plan` | **`String(post.feeRequired)`**(例 "0", "500"。Fanbox の post.info にプラン名が無いため金額で代替) |
 | `$filename` | file は `name`(人間可読)、image は URL basename(ハッシュ) |
@@ -112,14 +148,32 @@ context の組み立て(background)で以下のようにマッピングする。
 |---|---|
 | image | 1 つの ContentBlock(contentType: "photo")に `images[]` を順に格納 |
 | file | 1 つの ContentBlock。各 file は拡張子で判定(VIDEO_EXT 流用): video / file |
-| article | blocks を出現順に走査。連続する同種(image 群 / file 群)は type 別 ContentBlock に集約し、出現順で seq を振る |
+| article | blocks を出現順に走査。連続する同種(image 群 / file 群)は type 別 ContentBlock に集約し、出現順で seq を振る。**同一 post 内で同じ imageId / fileId が複数回出現した場合は初出のみ採用**(後続出現はスキップ。同一実体の重複 DL と `idemKey = postId:contentId` の衝突による job 上書き消失を防ぐ)。`$seq` / `$total` はスキップ後のユニークなファイル列に対して振る |
 | text / video / 未知 | files 空 → DL 対象なし |
 
 - `isRestricted: true` または `body: null` は空の PostData(contents: [])を返し、
   呼び出し側が「アクセス権なし」を通知。
-- FileItem の `refetch` 情報は `{postId, contentId, index}` を維持(fantia-dl 互換)。
-  ただし §7a により URL 失効が無いため、refetch は「投稿再編集で URL が変わった」場合の
-  再クリック時にのみ意味を持つ。
+- **識別子は Fanbox の安定 ID を主キーにする**(fantia-dl の ordinal 依存からの変更):
+  各 FileItem は Fanbox の item id(image/file item の `id`。article では imageId/fileId と同値)
+  を種別付きで `contentId = "image:{id}"` / `"file:{id}"` の形式に正規化して保持し、
+  `idemKey = postId:contentId`(= `postId:image:{id}` 等)とする。
+  imageMap と fileMap は**別名前空間**であり、Fanbox が両者間の ID 一意性を保証する根拠は
+  無いため、種別判別子で衝突を構造的に排除する(§6 の重複スキップ規則は名前空間ごとに適用)。`index`(パース順)は**ファイル名の $seq 用と整合性チェック専用**で、
+  識別には使わない。core の型(`refetch: {postId, contentId, index}`)は無改造で足りる。
+- 署名失効こそ無いが、**投稿の再編集でファイル URL(ハッシュ名)が差し替わる**ことは
+  あり得るため、fantia-dl の回復機構(`needs_page` 状態 + refetch)を**削らずそのまま残す**。
+  ただし `needs_page` へ落とす前に **failure classifier(normative)** を通す:
+  `chrome.downloads` の `onChanged` で `delta.error.current` を消費して分類し、
+  - `USER_*`(ユーザーキャンセル)/ `FILE_*`(ディスク満杯・パス不正等のローカル要因)は
+    **terminal `error`**(投稿ページを開いても直らないため needs_page にしない)
+  - `NETWORK_*`(一時的な回線断)は保存 URL の**有界リトライ(1 回)** → 再失敗で terminal `error`
+  - `SERVER_*`(403/404 等 = URL 失効・編集の可能性)のみ `needs_page` に遷移
+  分類器は純粋関数として実装し単体テストを必須とする。`needs_page` のジョブは、
+  次にその投稿ページでボタンを押したとき post.info を再取得して回復する。回復時のファイル特定は
+  **`contentId`(安定 ID)の一致のみで行い**、再取得後の投稿に該当 ID が無ければ
+  「投稿が編集され該当ファイルは存在しない」と**明示エラーにする**(ordinal で別ファイルに
+  誤バインドする静かな失敗を禁止)。resume(SW 再起動時)は保存 URL の再投入を第一手とし、
+  失敗したら同じ `needs_page` 経路に合流する。
 
 ## 7. 保存ダイアログ抑制
 
@@ -135,15 +189,246 @@ README / options に注意書き)。
 - **cookie 依存性**: 無料投稿は匿名アクセス可を実測済み。有料投稿が cookie 必須でも、
   `chrome.downloads` はブラウザのネットワークスタック(profile の cookie jar)で
   ダウンロードするため成功する見込み。**MVP1 hard gate(§13)で実証**する。
-- **フォールバック(予約設計・実装は gate 失敗時のみ)**: 万一 `downloads.download` が
-  有料コンテンツで 403 になる場合、background から `fetch(url, {credentials:"include"})`
-  (host_permissions により CORS 免除)→ offscreen で blob URL 化 → `downloads.download(blobUrl)`。
-  zip モードの既存 offscreen 経路と同じ仕組みで実装できる。
+- **フォールバック(方針のみ・スコープ外)**: 万一 `downloads.download` が有料コンテンツで
+  403 になる場合は、background fetch → offscreen blob 化の経路に切り替える方針とするが、
+  fantia-dl の blob 経路は job-store / reconcile の外にある one-shot 実装であり、
+  そのまま流用すると dedup・resume・`needs_page` 回復が丸ごと失われる。したがって
+  **このフォールバックは本 spec のスコープ外**とし、gate(§13-2)が実際に失敗した場合に
+  「永続化される source URL / refetch メタデータ・reconcile 規則を含む一級市民の DL モード」
+  として別途 spec 化してから実装する。それまで有料投稿 DL が 403 になる環境では
+  明示エラーを出すに留める(静かな失敗にしない)。
+
+## 7b. zip モードのバイナリ取得(Fanbox 固有の再設計・normative)
+
+fantia-dl の zip 経路は MAIN-world page script が対象 URL を fetch してバイト列を得るが、
+Fanbox では `downloads.fanbox.cc` が CORS 全拒否のため**この経路は成立しない**(§4 実測)。
+
+- **canonical 経路**: background(service worker)が `fetch(url, {credentials: "include"})` で
+  バイト列を取得する。`host_permissions: https://*.fanbox.cc/*` により拡張コンテキストの
+  fetch は CORS 免除される(MV3 の仕様)。取得したバイト列を offscreen に渡して
+  fflate で zip 化 → blob URL → `downloads.download`(zip 生成部は fantia-dl と同一)。
+- **hard gate(§13)**: 無料投稿で zip E2E(SW fetch → zip → 実保存)を MVP1 で実証する。
+  有料投稿は加入後に同じ gate を再実行(§13-2 と同時)。
+- **gate 失敗時のフォールバック**: SW fetch が cookie 事情等で 403 になる場合でも、
+  通常 DL(§7a)には影響しない。zip モードのみ「この投稿では zip を利用できない」を
+  明示エラーにして無効化する(静かな空 zip を作らない)。
+- **durability の位置づけ(normative)**: zip モードは fantia-dl と同様
+  **best-effort の one-shot 機能であり、durability 保証の対象外**とする。
+  job-store による dedup / resume / `needs_page` 回復は zip には適用されない
+  (fantia-dl README「zip モードの DL は 1 回きり扱いで履歴に残りません」と同一の契約)。
+  そのうえで最悪ケースを抑えるため:
+  - **サイズ制限(二段構え)**: 上限は単一の名前付き定数 **`ZIP_SOURCE_BUDGET_BYTES`
+    (既定 100MB)** とし、事前チェックと実行時バジェットの両方が**同じ値**を参照する。
+    (a) 事前チェック — サイズ既知の item(file item の `size`)の合計が
+    `ZIP_SOURCE_BUDGET_BYTES` を超える投稿は zip を開始せず「通常 DL を使って」と
+    明示エラー。件数上限(既定 100 件)も併用。
+    (b) **実行時バイトバジェット(normative)** — image item はサイズ不明のため、
+    zip 用ソース fetch 中に累積受信バイト数を計上し、`ZIP_SOURCE_BUDGET_BYTES` を
+    超えた時点で fetch を中止・部分 zip を作らず明示エラーにする。
+    **上限値と限界の明示**: コピー元の zip 経路は全ソースのメモリ保持 → `zipSync` の
+    全量バッファ → base64 チャンク → offscreen での Blob 再組立と、ピーク時に
+    ソースバイト数の数倍のライブメモリを要する。`ZIP_SOURCE_BUDGET_BYTES` の既定 100MB は
+    この増幅を織り込んで保守的に選んだ値である。
+    この上限は**クラッシュを保証付きで防ぐものではなく、リスクを実用範囲に抑える緩和策**
+    である(ピークメモリはソースの数倍になる前提で保守的に選んだ値)。
+    MVP1 で実測(§13-5 と同時に上限付近の投稿でピークメモリを確認)し、必要なら調整する。
+    ストリーミング zip(fflate の streaming API)への置き換えは、実測で問題が出た場合の
+    改善候補として記録に留める(現段階では fantia-dl とのコード共有を優先)。
+  - 途中失敗(SW suspend / offscreen 失敗 / fetch 失敗)は部分 zip を保存せず、
+    「zip は最初からやり直し。確実性が要るなら通常 DL を」という文言の明示エラーにする。
+  - options / README に「zip は再開不可の一括処理。大きい投稿は通常 DL 推奨」と明記する。
+  失敗の回復可能性が要るユースケースは通常 DL(§7a、ジョブ永続化あり)が正であり、
+  zip はあくまで携帯性のための補助機能という役割分担を仕様として固定する。
+
+## 7c. 継承 durability モデルの補強(fantia-dl からの変更・normative)
+
+fantia-dl の worker / job-store を土台にするが、以下 3 点は Fanbox 版で仕様として補強する
+(job-store は「無改造コピー」ではなく**小改修**になる。§17 に反映)。
+
+1. **download() と永続化の非アトミック性**: `chrome.downloads.download()` の呼び出しと
+   `downloadId` の永続化の間に SW が suspend すると、resume が同じジョブを再投入し得る。
+   `conflictAction: uniquify` により**上書き破壊は構造的に起きない**(最悪は「 (1)」付きの
+   重複ファイル)ことを仕様として明記した上で、重複自体も減らすため **lease 方式**を採る:
+   `download()` を呼ぶ**前に** `{idemKey, relPath, url, leasedAt}` の lease を永続化し、
+   成功後に `downloadId` で上書きする。resume の reconcile は、lease が残っている
+   (= crash window 内の)ジョブに限り `chrome.downloads.search({url})` を行い、
+   **(a) URL 完全一致 (b) `chrome.downloads` item の `filename`(絶対パス)を
+   セパレータ正規化(`\\` → `/`)した上で、`normalizedAbs === relPath` または
+   `normalizedAbs.endsWith("/" + relPath)` の**パス境界安全な一致**
+   (裸の suffix 一致は `foobar/baz.jpg` が `bar/baz.jpg` に誤マッチするため禁止)
+   (c) startTime が leasedAt 以降**の 3 条件を満たす項目だけを adopt する
+   (`filename` は絶対パスで返る — fantia-dl spec §10 で実証済み。この述語は
+   純粋関数として実装し、境界誤マッチのケースを含む単体テスト必須)。
+   条件を満たす項目が**複数残った場合は adopt を拒否**して通常の再投入に落とす
+   (どれが自ジョブの成果か決定できないため)。条件を満たす項目が無い場合も再投入。
+   このとき最悪ケースは uniquify による重複ファイル 1 個であり(§7c-1 冒頭)、
+   **adopt の失敗は常に安全側(重複)に倒れ、成果の欠落や上書きにはならない**。
+   **URL 一致だけで過去の履歴項目を成果と見なすことは禁止**
+   (Fanbox URL は安定・公開のため、古い手動 DL や旧テンプレ時代の完了項目と衝突し得る)。
+2. **有界の単一 ledger と原子的な状態遷移**: `chrome.storage.local` は 10MB。
+   ジョブ帳簿は fantia-dl と同じく**単一キー(`jobs`)の ledger** とし、各レコードが
+   state(pending / requested / done / error / needs_page)、
+   **`generation: number`(必須永続フィールド。初世代は 0、世代交代のたびに +1。
+   canonical パスの `.rev{N}` は常に `.rev{generation}` としてのみ導出する — 再計算・
+   リセットによる旧パス再利用の禁止。suspend / 再起動 / prune / divergent 回復をまたいで
+   単調増加が保たれることをテストで検証)**、世代情報(`supersededUrl` / `supersededAt`)、
+   および**現行世代の `leaseToken`**(非 terminal レコードに必須の一意トークン。
+   requeue・世代交代のたびに再発行)を持つ。
+   **原子性(normative)**: あらゆる状態遷移(enqueue・stale-history miss の世代交代・
+   完了・prune・クリア)は「ledger を読み、メモリ上で変換し、**1 回の
+   `chrome.storage.local.set({jobs})` で書く**」単一ステップで行う。単一キーの単一 set は
+   全体が反映されるか全く反映されないかのどちらかであり、**クロスキー移送という
+   中間状態がそもそも存在しない**(= クラッシュ時の回収規則・併存不変条件が不要)。
+   **書き込みの直列化(normative)**: ledger への全ミューテーションは SW 内の
+   **single-writer キュー(promise チェーン)**を必ず通す。enqueue / 起動時 reconcile /
+   `downloads.onChanged` / force / prune / clear は await を跨いで interleave し得るため、
+   read-modify-write の並行実行(last-write-wins による静かな破壊)を構造的に禁止する。
+   **キューの範囲(normative・デッドロック防止)**: キュー項目は「ledger を読む →
+   純粋関数で変換 → 1 回 set」という**短命な storage 操作のみ**を含む。
+   `chrome.downloads.download()` / `search()` / `cancel()` の呼び出し、terminal 遷移や
+   `download()` 解決の**待機は、必ずキューの外で行う**(§7c-3 の「lease 解決待ち」を
+   キュー内で行うと、待ちを解消する側の `onChanged` / promise 解決ハンドラの ledger 更新が
+   同じキューの後ろに詰まり、デッドロック/見かけ上のタイムアウトになるため)。
+   待機とイベントの対応付けには各 lease に発行する一意の **leaseToken** を用いる:
+   `download()` 解決・`onChanged` terminal 到達はそれぞれ「leaseToken X を解決した」という
+   短いキュー項目として ledger に反映し、force / clear の待機側はキュー外で
+   その解決を(有界時間)観測してから、削除という次の短いキュー項目を積む。
+   **CAS ガード(normative)**: あらゆる解決イベント(`download()` の fulfilled / rejected、
+   `onChanged`、cancel 完了、adoption 結果)による ledger ミューテーションは、変換関数内で
+   「対象レコードの現行 `leaseToken` がイベントの持つトークンと一致する」ことを確認し
+   (compare-and-swap)、不一致なら**旧世代の stale イベントとして無視**する。
+   これが無いと「lease A を cancel/timeout → 同一 idemKey に lease B を発行 → A の遅延解決が
+   到着して B のレコードを誤って done/error/downloadId 上書き」という静かな帳簿破壊が起きる。
+   必須テスト: lease A が force/requeue で lease B に置き換わった後に A の遅延解決が届く
+   ケースで、B のレコードが不変であること。
+   直列化キューも ledger 変換(純粋関数)もユニットとして切り出しテストする
+   (「force が lease 解決待ちの間も onChanged の更新が通る」ことのテストを含む)。
+   **量的上限(normative)**: ledger サイズは「terminal レコード上限 5,000 件(超過分は
+   古い順に prune)+ 1 年 sweep」で**有界**とする。prune は新レコード挿入と同一
+   ミューテーション内で行い、上限超過状態の ledger を書かない。有界であるため
+   「履歴肥大により書き込みが失敗する」経路は設計上排除される。
+   **generation の prune 耐性(normative)**: `generation > 0` のレコードを prune / sweep /
+   履歴クリアで削除する際は、ledger 内の別領域(`generations: {idemKey: maxGeneration}`)に
+   カウンタを残す(tombstone)。同一 idemKey の次回 enqueue は
+   `max(tombstone, 0) + 1` ではなく **tombstone を初期 generation として引き継ぐ**ことで
+   `.rev` パスの再利用を防ぐ。tombstone は「編集で世代交代が起きた idemKey」にしか
+   作られないため通常は極小だが、上限 10,000 件(超過分は古い順に削除)で有界化する。
+   tombstone が失われた場合(上限超過)の最悪ケースは canonical パス再利用 → uniquify
+   発動 → `pathDivergent` → divergent 回復(世代インクリメントで未使用パスに収束)であり、
+   **うるさいが静かな破壊にはならない**(このフォールバック連鎖もテスト対象)。
+   **書き込み失敗時の契約**: それでも `set()` が失敗した場合(他要因の quota 逼迫等)は
+   フェイルクローズし、新規 enqueue / resume / force を「ストレージ書き込みに失敗しました。
+   履歴をクリアするまで DL 機能を停止します」という明示エラーで拒否する
+   (live download と帳簿がずれた状態で走り続けることの禁止)。この失敗経路のテスト
+   (set をモックして失敗させる)を必須とする。
+   **通常 enqueue の再入規則(normative)**: 同一 `idemKey` に非 terminal レコード
+   (pending / requested)が既に存在し、その `{url, relPath}` が今回のレンダリング結果と
+   一致する場合、enqueue は「既にキュー済み/実行中」として**新しい lease も `download()` も
+   発行せずに返る**(ダブルクリック・同一投稿を開いた複数タブからの同時 enqueue が
+   典型)。live レコードを追い越して置換できるのは **force の世代交代スワップだけ**。
+   `{url, relPath}` が不一致の非 terminal レコードに遭遇した場合(編集直後の再クリック等)も
+   自動では置換せず、「進行中のダウンロードがあります。作り直すには再DLボタンを」と
+   明示通知する。必須レーステスト: ダブルクリック / 2 タブ同時 enqueue / lease 解決が
+   未完のうちに次の enqueue が到着、の 3 ケースで `download()` が二重発行されないこと。
+   **stale-history miss の世代交代**: URL 不一致による再ダウンロード(§8)は、同一
+   ミューテーション内で旧 done レコードを新 pending レコードに置換し、旧 `url` / `doneAt` を
+   `supersededUrl` / `supersededAt` に引き継ぐ。遷移は 1 回の set なので、再DL 中に SW が
+   再起動しても ledger には「pending(世代交代済み)」が単独で存在するだけであり、
+   誤回収の余地は無い(このシナリオも必須テスト)。
+   **canonical パス導出関数(normative)**: 「テンプレートのレンダリング結果(base パス)+
+   generation → canonical `relPath`」の昇格規則を**単一の純粋関数
+   `canonicalRelPath(basePath, generation)`** として固定する:
+   `generation === 0` なら basePath をそのまま、`generation > 0` なら拡張子の直前に
+   `.rev{generation}` を注入する(sanitizer / path validator を通す)。
+   この関数を **enqueue・dedup 比較・force・stale-history miss・divergent 回復・
+   resume adoption のすべての経路で共通利用**する。dedup 比較(§8)は「保存済みレコードの
+   `relPath` == canonicalRelPath(現在のレンダリング結果, レコードの `generation`)」で行う
+   ため、一度 `.revN` を発行したファイルもテンプレートが素の basePath を出し続ける限り
+   dedup が成立し続ける(毎回 miss して再DLし続けるループは構造的に起きない)。
+   単体テスト必須(gen 0 / gen>0 / dedup 回復の各ケース)。
+   **同一パス世代交代の canonical パス規則(normative・世代交代全般に適用: stale-history
+   miss / force / divergent 起点を問わない)**: 世代交代後のレンダリング結果
+   (canonicalRelPath 適用後)が旧レコードの `relPath` と同一になる場合
+   (「ファイルだけ差し替えられた」典型ケース)、
+   そのまま `downloads.download` に渡すと Chrome の `uniquify` が新バイトを
+   `foo (1).ext` に逃がし、**帳簿上の relPath は古いファイルを指したまま「最新」と
+   証明してしまう**。これを禁止し、拡張側が**決定的なバージョン付きパス**
+   (拡張子の直前に `.rev{N}`。N は世代番号。sanitizer / path validator を通す)を生成して
+   新世代の canonical `relPath` として永続化する(パスの決定権を uniquify に渡さない)。
+   adoption 述語・dedup の relPath 照合も、この canonical `relPath` を基準に働く。
+   バージョン付き命名は README に明記する(旧ファイルは自動削除しない)。
+   **実保存パスの記録と乖離の扱い(normative)**: ジョブ完了時(`onChanged` terminal)に
+   `chrome.downloads.search({id})` で Chrome が実際に保存した絶対パス(`filename`)を取得し、
+   レコードの `actualFilename` として永続化する。`actualFilename` が要求 `relPath` と
+   一致しない(境界安全比較。uniquify 発動等)場合はレコードに `pathDivergent` を立てる。
+   **`pathDivergent` な done レコードは dedup の権威にならない**(dedup miss として扱う):
+   帳簿が「`relPath` が最新」と証明できるのは実際にそのパスへ保存できた場合だけである。
+   divergent レコード起点の次の enqueue は世代交代スワップとして扱い、
+   **必ず拡張所有の `.rev{N}` canonical パスを新規に発行**して衝突源から離脱する
+   (再び uniquify に逃げられて divergent を繰り返すループの禁止)。
+   このケース(divergent → 再クリック → .revN で成功し dedup が回復)も必須テスト。
+3. **再DL・履歴クリアと進行中ジョブの整合**: `force`(再DL)は対象投稿の
+   非 terminal ジョブの `downloadId` を `chrome.downloads.cancel()` し、terminal 遷移を
+   確認(有界待機、タイムアウト時は明示エラー)した後、**レコードを削除するのではなく
+   stale-history miss と同一の単一ミューテーション世代交代スワップ(§7c-2)で
+   新 pending 世代に置換する**(世代番号をインクリメントし、旧 `url` / `doneAt` /
+   `relPath` を `superseded*` に引き継ぐ)。「削除してから盲目的に再作成」は、次の enqueue が
+   世代文脈を失って旧 `relPath` を再利用し、uniquify 逃げ(§7c-2)を再発させるため禁止。
+   **lease 未解決レコードの扱い(normative)**: lease は書かれたが `downloadId` が
+   まだ無いレコード(= `download()` 呼び出しが解決していない窓)は、force / クリアの
+   対象として**そのまま削除してはならない**。ブラウザ側で DL がこの後開始・完了し得るため、
+   削除すると帳簿に説明のつかない孤児ファイル/重複を残す。処理規則:
+   (a) SW が生きていて `download()` の promise が追跡できる場合はその解決を待つ
+   (解決後は通常の cancel → terminal 確認 → 削除の経路)。
+   (b) promise を失った場合(SW 再起動直後等)は、resume と同一の adoption 述語
+   (URL + 境界安全パス一致 + startTime >= leasedAt)で `chrome.downloads.search` を行い、
+   ヒットした項目を cancel(または terminal なら採用)してからレコードを削除する。
+   いずれの場合も **lease が未解決のままの削除・requeue は禁止**。
+   このシナリオ(lease 窓中の force / クリア)も必須テストに含める。
+   options の「履歴全クリア」は ledger 内の terminal レコード(done / error /
+   needs_page)のみ削除し、進行中(pending / requested)のレコードは terminal になるまで
+   残す(進行中 DL の帳簿を消して孤児化させない)。この選択的クリアも単一ミューテーション。
 
 ## 8. 衝突・重複、9. sanitizer、10. path validator / SW ライフサイクル / ジョブ永続化 / DL 履歴
 
-fantia-dl §8, §9, §10, §13(a) と同一。core・job-store は無改造コピー。
-DL 履歴の dedup キー(`idemKey = postId:contentId:index`)も同一形式。
+**fantia-dl §8 からの変更(normative)**: `conflictAction` は **`uniquify` のみ**をサポートし、
+fantia-dl にあった `overwrite` オプションは fanbox-dl では**提供しない**。
+本 spec の耐久性モデル(§7c)は「衝突時の最悪ケースは重複ファイルであり、既存バイトの
+無言置換は構造的に起きない」という uniquify の性質に依存しており、`overwrite` を許すと
+crash window・adoption miss・tombstone 喪失時の再投入が**既存ファイルの無言破壊**に化ける。
+バージョン管理は拡張所有の `.rev{generation}` 命名(§7c-2)が担う。
+その他は fantia-dl §8, §9, §10, §13(a) と同一。core は無改造コピー。job-store は §7c の 3 点
+(URL 採用 reconcile・件数上限 prune・set 失敗の明示通知・クリア時の進行中保護)を加えた小改修。
+DL 履歴の dedup キーは `idemKey = postId:contentId`(安定 ID ベース、§6)とし、
+  **dedup 判定は「idemKey の done レコードが存在し、かつレコードに保存された `url` と
+  `relPath` の両方が、現在の post.info とテンプレートから導いた値に一致する」場合のみ
+  成立**とする(JobRecord は元々 `url` と `relPath` を保持している)。
+  `relPath` 条件は、URL が同じでもテンプレート入力(投稿タイトル・article の並び順に
+  由来する `$seq` 等)が変わった場合に「古いパスに置き去りのまま永久スキップ」になる
+  アーカイブ乖離を防ぐ: レンダリング結果が変われば新世代として再ダウンロードする
+  (旧ファイルは自動削除しない — 再DL ボタンと同じ契約)。テンプレート変更そのものによる
+  一括再DL を望まない場合のために、この挙動は README に明記する。クリエイターがファイルを差し替えると `downloads.fanbox.cc` のハッシュ名
+  URL が変わるため、URL 不一致は「アーカイブが古い」ことを意味し、dedup を成立させず
+  再ダウンロードする(旧レコードは新レコードで置き換え、`supersededAt` を記録)。
+  これにより「done 済みの投稿が編集されても永久にスキップされ続ける」アーカイブ乖離を防ぐ。
+  **URL 不変の in-place 差し替えへの備え(normative)**: 「バイトが変われば URL(ハッシュ名)も
+  変わる」は Fanbox の実装観察に基づく仮定であり、保証ではない。このため done レコードには
+  取得時点の `post.updatedDatetime` を `postUpdatedAt` として永続化する。再クリック時に
+  現在の `updatedDatetime` がレコードより進んでいるのに該当ファイルの URL・relPath が
+  一致(= dedup 成立)する場合、**黙ってスキップせず**「投稿は更新されていますが、この
+  ファイルの URL は変わっていません。差し替えを確実に取り込むには 🔄(再DL)を使ってください」
+  という通知を出す。このシグナルは 2 フィールドに分離する:
+  **`lastDownloadedPostUpdatedAt`(実際にダウンロードした時のみ更新)**と
+  **`lastWarnedPostUpdatedAt`(同一 updatedDatetime についての通知重複を抑止するためだけに
+  更新)**。警告だけで前者を進めてはならない — さもないと通知を 1 回見逃しただけで
+  「更新済みだがローカルが古い」状態が以後永久に沈黙する。判定は
+  「現在の updatedDatetime > lastDownloadedPostUpdatedAt なら注意状態(警告対象)、
+  ただし lastWarnedPostUpdatedAt と同値なら通知は再送しない。さらに新しい更新が来れば
+  再度通知する」。注意状態は 🔄(force)による実ダウンロードでのみ解消される。
+  自動での全ファイル再DL はしない(本文の誤字修正でも全帯域を再取得することになるため。
+  ユーザーが 🔄 で明示的に選ぶ)。この通知経路(見逃し→再更新→再通知を含む)もテスト対象。
+  この判定もフィクスチャテストでカバーする(URL 差し替え後の再クリックで該当ファイル
+  だけ再 DL 対象になるケース、および URL 同一で `$seq` だけが変わるケース)。
 
 ## 11. レート制限・リトライ(Fanbox 固有・normative)
 
@@ -169,10 +454,7 @@ DL 履歴の dedup キー(`idemKey = postId:contentId:index`)も同一形式。
     "js": ["content/content-script.js"],
     "run_at": "document_idle"
   }],
-  "web_accessible_resources": [{
-    "resources": ["content/page-script.js"],
-    "matches": ["https://*.fanbox.cc/*"]
-  }]
+  "web_accessible_resources": []
 }
 ```
 
@@ -187,26 +469,51 @@ DL 履歴の dedup キー(`idemKey = postId:contentId:index`)も同一形式。
 1. **(hard gate)** image / file 各 1 件で「直 URL → `downloads.download` 実保存」を実証。
    `saveAs: false` でダイアログ無し保存(Chrome 設定 OFF 時)も確認。
 2. **(hard gate・§7a)** 有料投稿(加入後)で cookie 依存性を実証。403 ならフォールバック実装に切替。
-3. (最適化ゲート)content script(isolated world)直 fetch で post.info が 200 になるか。
-   なれば page script 注入を省略し canonical を isolated world に切替(既定は MAIN world)。
+3. (削除)— canonical は background fetch(§4a)に一本化したため、
+   isolated world / MAIN world の切替ゲートは無い。
 4. SPA 内遷移(クリエイターページ → 投稿ページ)でボタン注入が働くか。
+5. **(hard gate・§7b)** 無料投稿で zip モード E2E(SW fetch → fflate → 実保存)。
+   有料投稿分は §13-2 と同時に再実証。
+6. **(hard gate・§4a・実装の最初のマイルストーン)** background(SW)からの `post.info`
+   fetch が cookie 込みで 200 になること。**このゲートは実装プランの先頭に置く
+   (walking skeleton: manifest + SW + fetch だけの最小拡張で最初に実証し、
+   不成立なら他の実装に着手する前に方針を確定する)**。
+   失敗時は §4a の degraded モード契約に沿って spec を改訂してから続行する。
 
 ## 14. 設定(options)・15. テスト方針・16. 技術スタック
 
 fantia-dl §14〜16 と同一。
 
-- 設定: テンプレート / conflictAction / zip モード / DL 履歴クリア。`chrome.storage.sync`。
+- 設定: テンプレート / zip モード / DL 履歴クリア。`chrome.storage.sync`。
+  **`conflictAction` は設定項目として存在しない**(§8: uniquify 固定)。settings schema・
+  options UI から完全に撤去し、background は `uniquify` を定数として渡す。
+  settings 読み込み時に旧値・不正値として `conflictAction` が保存されていても無視する
+  (= いかなる保存値も `uniquify` を変えられない migration 規則)。
 - テスト: core は流用テストがそのまま green であること。`tests/parse.test.ts` は
   PoC で実測した JSON 構造のフィクスチャ(image / file / article / restricted / text)で TDD。
+  **必須フィクスチャ**:
+  1. 同じ imageId が非連続に 2 回出現する article(初出のみ採用・idemKey がユニーク)。
+  1b. imageId と fileId が同じ文字列値を持つ article(種別判別子により別ジョブとして共存)。
+  2. 「初回 DL と回復の間に投稿が編集・並べ替えされた」ケース(needs_page 回復が
+     安定 ID で正しいファイルに再バインドし、消えた ID は明示エラーになる)。
 - スタック: Bun + esbuild + vitest + tsc(strict)+ fflate。Nix flake + direnv。
   Renovate 設定(`.github/renovate.json`)もコピーし、初回の GitHub App 追加は shishi の手動 1 クリック。
 
 ## 17. fantia-dl からのコピー指針(実装プラン向け)
 
-- そのままコピー(無改造が原則): `src/core/*`, `src/offscreen/*`, `src/background/job-store.ts`,
+- そのままコピー(無改造が原則): `src/core/template-engine.ts` / `sanitizer.ts` /
+  `path-validator.ts` / `base64.ts`, `src/offscreen/*`(zip 生成部),
   `public/offscreen/*`, `public/options/*`, `scripts/build.mjs`, `tsconfig.json`,
   `vitest.config.ts`, `flake.nix`, `.envrc`, `.github/*`, core 系 `tests/*`
-- 書き換え: `src/fanbox/parse.ts`(新規 TDD), `src/content/*`(URL・SPA 対応・CSRF 削除),
-  `src/background/service-worker.ts`(resolver 削除・$plan マッピング), `public/manifest.json`,
+- 書き換え: `src/fanbox/parse.ts`(新規 TDD), `src/content/*`(URL・SPA 対応・CSRF 削除・
+  **page script と注入機構を完全撤去** §4a), `src/background/service-worker.ts`
+  (resolver 削除・post.info の canonical fetch 追加 §4a・$plan マッピング・
+  zip 用 SW fetch 追加 §7b・needs_page 経路は failure classifier 付きで維持 §6・
+  §7c の reconcile/クリア保護), `src/background/job-store.ts`(§7c: single-writer キュー・
+  原子的遷移・generation/lease/tombstone・件数上限 prune・set 失敗フェイルクローズ・
+  選択的クリア), `src/core/settings.ts` / `src/core/types.ts` / `src/options/*` /
+  `public/options/*`(§14: `conflictAction` の schema・UI・型からの撤去。core の他ファイル
+  — template-engine / sanitizer / path-validator / base64 — は無改造コピー),
+  `public/manifest.json`,
   `README.md`, `package.json`(name のみ)
 - fantia-dl 側リポには一切手を入れない。
