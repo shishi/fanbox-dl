@@ -83,9 +83,9 @@ fantia-dl と同一の Manifest V3・5 モジュール分離。
 ### 未実測(MVP マイルストーン1の hard gate、§13)
 - **有料投稿のファイル URL に cookie が必須か**は未実測(PoC 時点で有料プラン未加入のため)。
   §7a のフォールバック方針で吸収する。
-- **content script(isolated world)からの `post.info` fetch が cookie 込みで 200 になるか**は
-  ページ文脈(MAIN world 相当)では 200 実証済みだが、拡張の isolated world での最終確認は
-  §13-6 の hard gate(walking skeleton v2)で行う。失敗時はフェイルクローズ(§4a)。
+- **content script(isolated world)からの `post.info` fetch が cookie 込みで 200 になること**は
+  **2026-07-19 に gate v2(walking skeleton)で実証済み**(`origin=https://www.fanbox.cc
+  status=200 post.id=12272980 type=file`)。canonical 経路として確定。
 
 ## 4a. post.info 取得経路と信頼境界(normative)
 
@@ -565,11 +565,11 @@ DL 履歴の dedup キーは `idemKey = postId:stableContentId`(安定 ID ベー
 4. SPA 内遷移(クリエイターページ → 投稿ページ)でボタン注入が働くか。
 5. **(hard gate・§7b)** 無料投稿で zip モード E2E(SW ソース fetch → fflate → 実保存)。
    有料投稿分は §13-2 と同時に再実証。
-6. **(hard gate・§4a・実装の最初のマイルストーン)** **content script(isolated world)**
-   からの `post.info` fetch が cookie 込みで 200 になること。**このゲートは実装プランの
-   先頭に置く(walking skeleton v2: manifest + content script + fetch + console 出力の
-   最小拡張で実証)**。不成立なら他の実装に着手する前にフェイルクローズ方針の是非を
-   ユーザーと確定する。
+6. **(hard gate・§4a)【2026-07-19 PASS】** **content script(isolated world)**
+   からの `post.info` fetch が cookie 込みで 200 になること。walking skeleton v2 で実証済み
+   (`origin=https://www.fanbox.cc status=200`)。これにより canonical 経路が確定し、
+   `DownloadRequestMessage.json`(content script → SW)を committed interface とする。
+   (履歴: v1 の SW fetch は api.fanbox.cc の Origin ゲートで 400 → content-script-canonical に変更)
 
 ## 14. 設定(options)・15. テスト方針・16. 技術スタック
 
@@ -596,11 +596,14 @@ fantia-dl §14〜16 と同一。
   `path-validator.ts` / `base64.ts`, `src/offscreen/*`(zip 生成部),
   `public/offscreen/*`, `public/options/*`, `scripts/build.mjs`, `tsconfig.json`,
   `vitest.config.ts`, `flake.nix`, `.envrc`, `.github/*`, core 系 `tests/*`
-- 書き換え: `src/fanbox/parse.ts`(新規 TDD), `src/content/*`(URL・SPA 対応・CSRF 削除・
-  **page script と注入機構を完全撤去** §4a), `src/background/service-worker.ts`
-  (resolver 削除・post.info の canonical fetch 追加 §4a・$plan マッピング・
-  zip 用 SW fetch 追加 §7b・needs_page 経路は failure classifier 付きで維持 §6・
-  §7c の reconcile/クリア保護), `src/background/job-store.ts`(§7c: single-writer キュー・
+- 書き換え: `src/fanbox/parse.ts`(新規 TDD), `src/fanbox/api.ts`(新規 TDD:
+  fetchPostInfo は content script が呼ぶ / validatePostInfo は SW が呼ぶ §4a),
+  `src/content/*`(URL・SPA 対応・CSRF 削除・**page script と注入機構を完全撤去** §4a・
+  **post.info を isolated world で fetch し json を SW へ送る** §4a),
+  `src/background/service-worker.ts`(=orchestrator 束縛。resolver 削除・
+  **post.info fetch は持たず、受領 json を validatePostInfo で検証して parse** §4a・
+  $plan マッピング・zip 用 SW fetch 追加 §7b・needs_page 経路は failure classifier 付きで
+  維持 §6・§7c の reconcile/クリア保護), `src/background/job-store.ts`(§7c: single-writer キュー・
   原子的遷移・generation/lease/tombstone・件数上限 prune・set 失敗フェイルクローズ・
   選択的クリア), `src/core/settings.ts` / `src/core/types.ts` / `src/options/*` /
   `public/options/*`(§14: `conflictAction` の schema・UI・型からの撤去。core の他ファイル
