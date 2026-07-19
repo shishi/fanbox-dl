@@ -57,7 +57,6 @@ export interface EnqueueResult {
   errors: string[];
 }
 
-const TERMINAL: ReadonlySet<JobState> = new Set(["done", "error", "needs_page"]);
 
 // 世代交代スワップ(stale-miss / force / divergent 共通)。同一パスに落ちる場合は
 // さらに +1 して .revN の未使用パスへ離脱する(uniquify にパス決定権を渡さない)。
@@ -122,7 +121,7 @@ export function applyEnqueue(
       continue;
     }
 
-    if (!TERMINAL.has(prev.state)) {
+    if (!TERMINAL_STATES.has(prev.state)) {
       // 進行中(spec §7c-2 再入規則)。force はこの関数に来る前に caller が解決済みにする
       // 契約だが、防御的に force でも swap する(cancel 済み前提)。
       if (opts.force) {

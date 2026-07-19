@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  emptyLedger, applyEnqueue, applyDownloadStarted,
+  emptyLedger, applyEnqueue, applyDownloadStarted, applyDownloadRequestFailed, applyReissueLease,
   applyDownloadComplete, applyDownloadInterrupted, applyNeedsPageRecovery,
   applyClearTerminal, applyPruneSweep, findLeasesWithoutDownloadId, applyInvalidateByIds,
   type Ledger, type JobRecord,
@@ -79,6 +79,31 @@ describe("lease/CAS ライフサイクル", () => {
     const started = applyDownloadStarted(l, "111:image:a", token, 1);
     expect(applyDownloadInterrupted(started, "111:image:a", token, "needs_page", "SERVER_BAD_CONTENT", mkTok, 0).jobs["111:image:a"].state).toBe("needs_page");
     expect(applyDownloadInterrupted(started, "111:image:a", token, "terminal_error", "USER_CANCELED", mkTok, 0).jobs["111:image:a"].state).toBe("error");
+  });
+
+  it("requestFailed: pending -> error + terminalAt (CAS test)", () => {
+    const { l, token } = enq();
+    const started = applyDownloadStarted(l, "111:image:a", token, 1);
+    const failed = applyDownloadRequestFailed(started, "111:image:a", token, "DOWNLOAD_FAILED", 15_000);
+    expect(failed.jobs["111:image:a"].state).toBe("error");
+    expect(failed.jobs["111:image:a"].error).toBe("DOWNLOAD_FAILED");
+    expect(failed.jobs["111:image:a"].terminalAt).toBe(15_000);
+    expect(failed.jobs["111:image:a"].leaseToken).toBeUndefined();
+    const failed2 = applyDownloadRequestFailed(started, "111:image:a", "WRONG_TOKEN", "ERROR", 15_000);
+    expect(failed2.jobs["111:image:a"]).toEqual(started.jobs["111:image:a"]);
+  });
+  it("reissueLease: oldToken match issues new token, mismatch returns record: null (CAS test)", () => {
+    const { l, token } = enq();
+    const newToken = mkTok();
+    const r = applyReissueLease(l, "111:image:a", token, newToken, 12_000);
+    expect(r.record).toBeDefined();
+    expect(r.record!.state).toBe("pending");
+    expect(r.record!.leaseToken).toBe(newToken);
+    expect(r.record!.leasedAt).toBe(12_000);
+    expect(r.record!.downloadId).toBeUndefined();
+    const r2 = applyReissueLease(l, "111:image:a", "WRONG_TOKEN", mkTok(), 12_000);
+    expect(r2.record).toBeNull();
+    expect(r2.ledger).toEqual(l);
   });
 });
 
@@ -167,6 +192,21 @@ describe("needs_page 回復 (spec §6 / §14-2)", () => {
 });
 
 describe("clear / prune / tombstone (spec §7c-2/§7c-3)", () => {
+  it("same-mutation prune: ledger never exceeds cap (spec 7c-2)", () => {
+    const mkDone = (i: number): JobRecord => ({
+      idemKey: `k${i}`, postId: "1", stableContentId: `image:${i}`, contentType: "photo",
+      relPath: `p/${i}`, url: `u${i}`, generation: 0, state: "done", doneAt: 1000 + i,
+      refetch: { postId: "1", stableContentId: `image:${i}`, index: 0 },
+    });
+    const seeded: Ledger = { jobs: { k1: mkDone(1), k2: mkDone(2) }, generations: {} };
+    const r = applyEnqueue(seeded, [cand()], { ...baseOpts, caps: { maxTerminal: 2 } });
+    const started = applyDownloadStarted(r.ledger, "111:image:a", r.toStart[0].leaseToken!, 5);
+    const done = applyDownloadComplete(started, "111:image:a", r.toStart[0].leaseToken!, "/dl/fanbox/s/T/a.jpeg", 9999, { maxTerminal: 2 });
+    const terminals = Object.values(done.jobs).filter((j) => j.state === "done");
+    expect(terminals).toHaveLength(2);
+    expect(done.jobs["k1"]).toBeUndefined();
+    expect(done.jobs["111:image:a"].state).toBe("done");
+  });
   it("clearTerminal は terminal のみ削除し、進行中を残し、gen>0 は tombstone 化", () => {
     const { l, token } = enq();
     const done = applyDownloadComplete(applyDownloadStarted(l, "111:image:a", token, 1), "111:image:a", token, "/dl/fanbox/s/T/a.jpeg", 1);
