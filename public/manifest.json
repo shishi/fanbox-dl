@@ -1,17 +1,16 @@
 {
   "manifest_version": 3,
   "name": "fanbox-dl",
-  "version": "0.0.2",
-  "description": "pixivFANBOX downloader (walking skeleton v2 - content script gate)",
+  "version": "0.1.0",
+  "description": "pixivFANBOX の投稿をテンプレート命名で自動ダウンロード(個人アーカイブ用)",
   "permissions": ["downloads", "storage", "offscreen"],
+  "background": { "service_worker": "background/service-worker.js", "type": "module" },
   "host_permissions": ["https://*.fanbox.cc/*"],
   "content_scripts": [
-    {
-      "matches": ["https://*.fanbox.cc/*"],
-      "js": ["content/content-script.js"],
-      "run_at": "document_idle"
-    }
+    { "matches": ["https://*.fanbox.cc/*"], "js": ["content/content-script.js"], "run_at": "document_idle" }
   ],
-  "action": { "default_title": "fanbox-dl gate v2" },
+  "web_accessible_resources": [],
+  "options_page": "options/options.html",
+  "action": { "default_title": "fanbox-dl" },
   "icons": {}
 }

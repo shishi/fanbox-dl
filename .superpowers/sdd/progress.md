@@ -11,3 +11,6 @@ Task 10: complete (commits 94606b0,7bcaaa3, review clean after test-gap fix, 109
 Task 11: complete (commit 50fc192, 114 tests, controller-inspected)
 Task 12: complete (commit 87ce9ec, 125 tests, controller-inspected)
 Task 13: complete (commit 8fcef32, 128 tests, controller-inspected)
+Task 14: complete (commit 60630b8, 144 tests, review SPEC clean)
+  Minor(最終レビュー triage): registerZipDownload の未使用 deps + finishZipDownload との zipDownloads.set 重複; handleZipDownloadChange doc-comment がブランケット契約(非 terminal delta で false)と字義不一致
+Task 15: complete (153 tests, typecheck 0, build: content/background/offscreen green, options entry pending Task 16, codex review native: options 依存の既知ギャップのみ)
