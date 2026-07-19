@@ -1,7 +1,6 @@
 // src/options/options.ts
 import { loadSettings, saveSettings, CONFLICT_ACTION } from "../core/settings";
-import { renderTemplate, TemplateError } from "../core/template-engine";
-import { validatePath } from "../core/path-validator";
+import { checkTemplate, hasBlockingTemplateError, type TemplateCheckInput } from "./validate-templates";
 import type { RenderContext, Settings } from "../core/types";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -22,27 +21,25 @@ const zipEntrySample: RenderContext = { ...singleSample };
 
 let cur: Settings;
 
-function renderPreview(tpl: string, ctx: RenderContext, previewEl: string, errEl: string) {
-  try {
-    const rel = renderTemplate(tpl, ctx, {
-      replacement: ($("repl") as HTMLInputElement).value || "_",
-      segmentMaxLen: cur.segmentMaxLen,
-    });
-    const v = validatePath(rel, {
-      fullPathMaxLen: cur.fullPathMaxLen,
-      uniquifyHeadroom: cur.uniquifyHeadroom,
-      conflictAction: CONFLICT_ACTION,
-      segmentMaxLen: cur.segmentMaxLen,
-    });
-    $(previewEl).textContent = rel;
-    $(errEl).textContent = v.ok ? "" : `検証エラー: ${v.error}`;
-  } catch (e) {
-    $(previewEl).textContent = "";
-    $(errEl).textContent = e instanceof TemplateError ? `テンプレートエラー: ${e.message}` : String(e);
-  }
+function templateInput(tpl: string, ctx: RenderContext): TemplateCheckInput {
+  return {
+    tpl, ctx,
+    replacement: ($("repl") as HTMLInputElement).value || "_",
+    segmentMaxLen: cur.segmentMaxLen,
+    fullPathMaxLen: cur.fullPathMaxLen,
+    uniquifyHeadroom: cur.uniquifyHeadroom,
+    conflictAction: CONFLICT_ACTION,
+  };
 }
 
-function updateAllPreviews() {
+// renderPreview は checkTemplate(純粋関数)の結果を DOM に反映するだけ。
+function renderPreview(tpl: string, ctx: RenderContext, previewEl: string, errEl: string): void {
+  const { rel, error } = checkTemplate(templateInput(tpl, ctx));
+  $(previewEl).textContent = rel;
+  $(errEl).textContent = error;
+}
+
+function updateAllPreviews(): void {
   renderPreview(($("tpl") as HTMLInputElement).value, singleSample, "preview", "tplErr");
   renderPreview(($("zip_path_tpl") as HTMLInputElement).value, zipPathSample, "zip_path_preview", "zipPathErr");
   renderPreview(($("zip_entry_tpl") as HTMLInputElement).value, zipEntrySample, "zip_entry_preview", "zipEntryErr");
@@ -65,6 +62,27 @@ async function init() {
   updateAllPreviews();
 
   $("save").addEventListener("click", async () => {
+    // 最終レビュー修正3: 現在プレビューがテンプレ/パス検証エラーを表示している状態では
+    // 保存しない(古い DOM の textContent ではなく、クリック時点で再計算した結果で判定する)。
+    // ただし zip テンプレは zipGalleries + contentTypes.photo が有効な場合しか
+    // 実際には使われない(zipEligible の契約)。zip モードを使っていないユーザーが
+    // 無関係な設定変更(zip モードの無効化自体を含む)まで保存できなくなる regression を
+    // 避けるため、zip 未使用時は zip テンプレのエラーをブロック対象に含めない
+    // (codex レビュー指摘 P2 round3)。
+    updateAllPreviews();
+    const zipModeActive = ($("zip_galleries") as HTMLInputElement).checked && ($("ct_photo") as HTMLInputElement).checked;
+    const blocking = hasBlockingTemplateError(
+      templateInput(($("tpl") as HTMLInputElement).value, singleSample),
+      {
+        zipModeActive,
+        zipPath: templateInput(($("zip_path_tpl") as HTMLInputElement).value, zipPathSample),
+        zipEntry: templateInput(($("zip_entry_tpl") as HTMLInputElement).value, zipEntrySample),
+      },
+    );
+    if (blocking) {
+      alert("テンプレートにエラーがあります。修正してください");
+      return;
+    }
     cur = {
       ...cur,
       pathTemplate: ($("tpl") as HTMLInputElement).value,

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { createOrchestrator, type OrchestratorDeps } from "../src/background/orchestrator";
 import { JobStore } from "../src/background/job-store";
+import { applyEnqueue } from "../src/background/ledger";
 import { DEFAULT_SETTINGS } from "../src/core/settings";
 
 const memStorage = () => {
@@ -98,5 +99,70 @@ describe("orchestrator (SW 層の spec 契約)", () => {
     expect(after.error).toContain("未加入の有料コンテンツの可能性");
     expect(after.refusedUrl).toBe(after.url);
     expect(downloaded.length).toBeGreaterThan(0);
+  });
+
+  it("起動時 reconcile: crash-window adoption が complete でも finalUrl が allowlist 外なら done にせず error にする (spec §4a-3 / 最終レビュー修正1)", async () => {
+    const { deps, store } = mkDeps();
+    const url = "https://downloads.fanbox.cc/images/post/1/a.jpeg";
+    const relPath = "fanbox/s/T/a.jpeg";
+    await store.commit((l) => {
+      const r = applyEnqueue(l, [{
+        idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+        url, basePath: relPath,
+        refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+      }], { force: false, postUpdatedAt: "x", now: 1000, newLeaseToken: () => "L1", validatePath: () => null });
+      return { ledger: r.ledger, result: null };
+    });
+    // adoption 検索(url 指定)ではヒットを返し、後段の実体再取得(id 指定)では
+    // finalUrl が allowlist 外(redirect された想定)を返す。
+    deps.downloads.search = async (q: any) => {
+      if (q?.id === 55) return [{ id: 55, url, finalUrl: "https://evil.example.com/a.jpeg", filename: `/dl/${relPath}`, state: "complete" } as any];
+      return [{ id: 55, url, filename: `/dl/${relPath}`, startTime: new Date(2000).toISOString(), state: "complete" }];
+    };
+    const o = createOrchestrator(deps);
+    await o.runStartupReconcile();
+    const rec = (await store.read()).jobs["1:image:a"];
+    expect(rec.state).toBe("error"); // done にしない
+    expect(rec.error).toContain("許可外");
+  });
+
+  it("起動時 reconcile: requested の実 DL が complete でも finalUrl が allowlist 外なら done にせず error にする (spec §4a-3 / 最終レビュー修正1)", async () => {
+    const { deps, store } = mkDeps();
+    const o = createOrchestrator(deps);
+    await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a")]) });
+    const rec0 = Object.values((await store.read()).jobs)[0];
+    deps.downloads.search = async (q: any) => {
+      if (q?.id === rec0.downloadId) return [{ id: rec0.downloadId, finalUrl: "https://evil.example.com/a.jpeg", filename: "/dl/x", state: "complete" } as any];
+      return [];
+    };
+    await o.runStartupReconcile();
+    const after = (await store.read()).jobs[rec0.idemKey];
+    expect(after.state).toBe("error"); // done にしない
+    expect(after.error).toContain("許可外");
+  });
+
+  it("起動時 reconcile: crash-window adoption 後の実体再取得が空(race)なら finalUrl 未検証のまま done にせず fail-closed で error にする (codex レビュー指摘 P3 round2)", async () => {
+    const { deps, store } = mkDeps();
+    const url = "https://downloads.fanbox.cc/images/post/1/a.jpeg";
+    const relPath = "fanbox/s/T/a.jpeg";
+    await store.commit((l) => {
+      const r = applyEnqueue(l, [{
+        idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+        url, basePath: relPath,
+        refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+      }], { force: false, postUpdatedAt: "x", now: 1000, newLeaseToken: () => "L1", validatePath: () => null });
+      return { ledger: r.ledger, result: null };
+    });
+    // adoption 検索(url 指定)ではヒットを返すが、後段の実体再取得(id 指定)は
+    // history clear 等のレースで空配列を返す想定。ここで hit.url(常に allowlist 内)を
+    // 「検証済み finalUrl」として採用すると、redirect bypass を再び許してしまう。
+    deps.downloads.search = async (q: any) => {
+      if (q?.id === 55) return [];
+      return [{ id: 55, url, filename: `/dl/${relPath}`, startTime: new Date(2000).toISOString(), state: "complete" } as any];
+    };
+    const o = createOrchestrator(deps);
+    await o.runStartupReconcile();
+    const rec = (await store.read()).jobs["1:image:a"];
+    expect(rec.state).toBe("error"); // 検証できないまま done にしない(fail-closed)
   });
 });

@@ -11,7 +11,7 @@ import {
   applyEnqueue, applyDownloadStarted, applyDownloadRequestFailed, applyDownloadComplete,
   applyDownloadInterrupted, applyNeedsPageRecovery, applyPruneSweep,
   findLeasesWithoutDownloadId, applyReissueLease, applyInvalidateByIds,
-  type EnqueueCandidate, type JobRecord,
+  type EnqueueCandidate, type JobRecord, type Ledger,
 } from "./ledger";
 import { JobStore, StorageWriteError } from "./job-store";
 import { settleInFlight } from "./settle";
@@ -53,6 +53,21 @@ export function createOrchestrator(deps: OrchestratorDeps): {
     return v.ok ? null : v.error;
   };
 
+  // spec §4a-3(緩和): complete 到達時は必ず最終 URL を allowlist で再検証する(redirect 対策)。
+  // handleDownloadChanged の実 DL complete 経路と、runStartupReconcile の 2 つの complete
+  // 経路(crash-window adoption / requested reconcile)は、どれも同じ純粋変換をここに集約する。
+  function finalizeComplete(
+    l: Ledger, rec: JobRecord, token: string,
+    item: { finalUrl?: string; url?: string; filename?: string } | undefined,
+    now: number,
+  ): Ledger {
+    const finalUrl = item?.finalUrl || item?.url || rec.url;
+    if (!validateMediaUrl(finalUrl, rec.postId).ok) {
+      return applyDownloadInterrupted(l, rec.idemKey, token, "terminal_error", "ダウンロードが許可外 URL にリダイレクトされました", newLeaseToken, now);
+    }
+    return applyDownloadComplete(l, rec.idemKey, token, item?.filename ?? "", now);
+  }
+
   // download() はキューの外で呼ぶ(spec §7c-2 デッドロック防止)。結果反映は短いキュー項目。
   function startDownload(rec: JobRecord): Promise<void> {
     const token = rec.leaseToken!;
@@ -87,6 +102,7 @@ export function createOrchestrator(deps: OrchestratorDeps): {
     cancel: (id: number) => deps.downloads.cancel(id),
     now: deps.now,
     sleep: (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+    newLeaseToken,
   };
 
   async function handleDownloadRequest(msg: DownloadRequestMessage): Promise<DownloadResponse> {
@@ -255,12 +271,7 @@ export function createOrchestrator(deps: OrchestratorDeps): {
       // spec §7c-2: 実保存パスを取得して乖離を判定
       const [item] = await deps.downloads.search({ id: delta.id });
       // spec §4a-3(緩和): 最終 URL が allowlist を抜けていたら done にせず error 化(redirect 対策)
-      const finalUrl = (item as any)?.finalUrl || item?.url || rec.url;
-      if (!validateMediaUrl(finalUrl, rec.postId).ok) {
-        await store.commit((l) => ({ ledger: applyDownloadInterrupted(l, rec.idemKey, token, "terminal_error", "ダウンロードが許可外 URL にリダイレクトされました", newLeaseToken, deps.now()), result: null }));
-        return;
-      }
-      await store.commit((l) => ({ ledger: applyDownloadComplete(l, rec.idemKey, token, item?.filename ?? "", deps.now()), result: null }));
+      await store.commit((l) => ({ ledger: finalizeComplete(l, rec, token, item, deps.now()), result: null }));
       return;
     }
     const [item] = await deps.downloads.search({ id: delta.id });
@@ -297,7 +308,22 @@ export function createOrchestrator(deps: OrchestratorDeps): {
       if (hit) {
         await store.commit((l) => ({ ledger: applyDownloadStarted(l, rec.idemKey, rec.leaseToken!, hit.id), result: null }));
         if (hit.state === "complete") {
-          await store.commit((l) => ({ ledger: applyDownloadComplete(l, rec.idemKey, rec.leaseToken!, hit.filename, deps.now()), result: null }));
+          // spec §4a-3(緩和): ここも handleDownloadChanged と同じ finalUrl 再検証を通す
+          // (採用述語は URL/パス/時刻だけで adopt するため、redirect 済みかどうかは未確認)。
+          const [d] = await deps.downloads.search({ id: hit.id });
+          if (d) {
+            await store.commit((l) => ({ ledger: finalizeComplete(l, rec, rec.leaseToken!, d, deps.now()), result: null }));
+          } else {
+            // 2 回目の search が history clear 等のレースで空を返す場合(codex レビュー指摘
+            // P3 round2): hit.url(常に allowlist 内 = 検証済み request URL)を finalUrl の
+            // 代わりに使うと、redirect bypass チェックをすり抜けさせてしまう
+            // (hit.url は「検証済み finalUrl」ではなく単なる元 URL)。fail-closed で
+            // error に倒し、done と誤認させない。
+            await store.commit((l) => ({
+              ledger: applyDownloadInterrupted(l, rec.idemKey, rec.leaseToken!, "terminal_error", "ダウンロード完了を確認できませんでした(実体を再取得できません)", newLeaseToken, deps.now()),
+              result: null,
+            }));
+          }
         } else if (hit.state === "interrupted") {
           // 採用した実体が既に interrupted の場合、ここで分類まで済ませないと
           // 「requested のまま enqueue をブロックし続ける」wedge になる
@@ -336,7 +362,8 @@ export function createOrchestrator(deps: OrchestratorDeps): {
         continue;
       }
       if (d.state === "complete") {
-        await store.commit((l) => ({ ledger: applyDownloadComplete(l, rec.idemKey, rec.leaseToken!, d.filename, deps.now()), result: null }));
+        // spec §4a-3(緩和): 再検証は d(検索結果の実 DownloadItem)の finalUrl でそのまま行える
+        await store.commit((l) => ({ ledger: finalizeComplete(l, rec, rec.leaseToken!, d, deps.now()), result: null }));
       } else if (d.state === "interrupted") {
         const reason = d.error ?? "interrupted";
         const action = classifyDownloadError(reason === "interrupted" ? undefined : reason);

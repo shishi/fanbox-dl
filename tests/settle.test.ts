@@ -88,4 +88,61 @@ describe("settleInFlight (spec §7c-3 lease 窓中の force)", () => {
     expect(errors.length).toBe(1);
     expect(errors[0]).toContain("タイムアウト");
   });
+
+  it("promise 喪失 + adoption が interrupted を見つけたら即分類してタイムアウトしない (spec §6/§7c-3 / 最終レビュー修正2)", async () => {
+    const store = new JobStore(memStorage());
+    await seedPending(store);
+    const errors = await settleInFlight("111", {
+      store, inFlight: new Map(),
+      search: async (q: any) => {
+        if (q?.id === 7) return [{ id: 7, filename: "/dl/fanbox/s/T/a.jpeg", error: "SERVER_FORBIDDEN", state: "interrupted" }];
+        return [{ id: 7, url: "https://downloads.fanbox.cc/images/post/111/a.jpeg", filename: "/dl/fanbox/s/T/a.jpeg", startTime: new Date(2000).toISOString(), state: "interrupted" }];
+      },
+      cancel: async () => {}, now: (() => { let t = 0; return () => (t += 6000); })(), sleep: async () => {},
+    });
+    expect(errors).toEqual([]); // タイムアウトエラーにならない
+    const l = await store.read();
+    expect(l.jobs["111:image:a"].state).toBe("error"); // その場で確定
+    expect(l.jobs["111:image:a"].error).toContain("未加入の有料コンテンツの可能性"); // SERVER_FORBIDDEN の明示文言
+  });
+
+  it("promise 喪失 + adoption が NETWORK_ interrupted(retry_once 相当)を見つけても pending のまま放置しない (codex レビュー指摘 P2)", async () => {
+    const store = new JobStore(memStorage());
+    await seedPending(store);
+    const errors = await settleInFlight("111", {
+      store, inFlight: new Map(),
+      search: async (q: any) => {
+        if (q?.id === 7) return [{ id: 7, filename: "/dl/fanbox/s/T/a.jpeg", error: "NETWORK_TIMEOUT", state: "interrupted" }];
+        return [{ id: 7, url: "https://downloads.fanbox.cc/images/post/111/a.jpeg", filename: "/dl/fanbox/s/T/a.jpeg", startTime: new Date(2000).toISOString(), state: "interrupted" }];
+      },
+      cancel: async () => {}, now: (() => { let t = 0; return () => (t += 6000); })(), sleep: async () => {},
+    });
+    expect(errors).toEqual([]);
+    const l = await store.read();
+    // settle は force 前処理として非 terminal を残さない契約(spec §7c-3)。
+    // retry_once の pending を放置して settleInFlight が「解決済み」と報告すると、
+    // 誰も再ダウンロードを蹴らないまま force 後続処理を進めてしまう(wedge)。
+    expect(l.jobs["111:image:a"].state).not.toBe("pending");
+    expect(l.jobs["111:image:a"].state).toBe("error"); // terminal に倒して settle 完了とする
+  });
+
+  it("adoption が interrupted だが実体の再取得(id 指定)が空(race)なら reason を確定できないまま terminal 化しない (codex レビュー指摘 P2 round2)", async () => {
+    const store = new JobStore(memStorage());
+    await seedPending(store);
+    const errors = await settleInFlight("111", {
+      store, inFlight: new Map(),
+      search: async (q: any) => {
+        if (q?.id === 7) return []; // race: 実体を再取得できない(reason 不明)
+        return [{ id: 7, url: "https://downloads.fanbox.cc/images/post/111/a.jpeg", filename: "/dl/fanbox/s/T/a.jpeg", startTime: new Date(2000).toISOString(), state: "interrupted" }];
+      },
+      cancel: async () => {}, now: (() => { let t = 0; return () => (t += 6000); })(), sleep: async () => {},
+    });
+    // reason(SERVER_FORBIDDEN 等)を確定できない以上、安易に一般的な terminal_error へ
+    // 丸めて refusedUrl を失わせない。fail-closed でタイムアウト待機に落ちて
+    // 明示エラーとして可視化される(force 後続処理を進めない)。
+    expect(errors.length).toBe(1);
+    expect(errors[0]).toContain("タイムアウト");
+    const l = await store.read();
+    expect(l.jobs["111:image:a"].refusedUrl).toBeUndefined();
+  });
 });
