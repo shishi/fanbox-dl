@@ -130,7 +130,7 @@ context の組み立て(background)で以下のようにマッピングする。
 | `$date{fmt}` | `post.publishedDatetime` |
 | `$today{fmt}` | 実行日(変更なし) |
 | `$contentTitle` | **常に null**(Fanbox にコンテンツブロック題名が無い。`[...]` で自然に消える) |
-| `$contentId` | image/file item の `id`(article は imageId/fileId と同値。idemKey / refetch の主キーでもある §6) |
+| `$contentId` | **ContentBlock の post 内通し番号("1", "2", …)**。fantia-dl の block-id 相当で、通常 DL・zip の両テンプレ文脈で同じ値(テンプレ用の値であり、識別子ではない。identity は §6 の `stableContentId` = `image:{id}` / `file:{id}` が担い、テンプレには出さない) |
 | `$contentType` | photo / file / video(§6 のマッピング) |
 | `$plan` | **`String(post.feeRequired)`**(例 "0", "500"。Fanbox の post.info にプラン名が無いため金額で代替) |
 | `$filename` | file は `name`(人間可読)、image は URL basename(ハッシュ) |
@@ -148,18 +148,32 @@ context の組み立て(background)で以下のようにマッピングする。
 |---|---|
 | image | 1 つの ContentBlock(contentType: "photo")に `images[]` を順に格納 |
 | file | 1 つの ContentBlock。各 file は拡張子で判定(VIDEO_EXT 流用): video / file |
-| article | blocks を出現順に走査。連続する同種(image 群 / file 群)は type 別 ContentBlock に集約し、出現順で seq を振る。**同一 post 内で同じ imageId / fileId が複数回出現した場合は初出のみ採用**(後続出現はスキップ。同一実体の重複 DL と `idemKey = postId:contentId` の衝突による job 上書き消失を防ぐ)。`$seq` / `$total` はスキップ後のユニークなファイル列に対して振る |
+| article | blocks を出現順に走査。連続する同種(image 群 / file 群)は type 別 ContentBlock に集約し、出現順で seq を振る。**同一 post 内で同じ imageId / fileId が複数回出現した場合は初出のみ採用**(後続出現はスキップ。同一実体の重複 DL と `idemKey = postId:stableContentId` の衝突による job 上書き消失を防ぐ)。`$seq` / `$total` はスキップ後のユニークなファイル列に対して振る |
 | text / video / 未知 | files 空 → DL 対象なし |
 
 - `isRestricted: true` または `body: null` は空の PostData(contents: [])を返し、
   呼び出し側が「アクセス権なし」を通知。
 - **識別子は Fanbox の安定 ID を主キーにする**(fantia-dl の ordinal 依存からの変更):
   各 FileItem は Fanbox の item id(image/file item の `id`。article では imageId/fileId と同値)
-  を種別付きで `contentId = "image:{id}"` / `"file:{id}"` の形式に正規化して保持し、
-  `idemKey = postId:contentId`(= `postId:image:{id}` 等)とする。
+  を種別付きで `stableContentId = "image:{id}"` / `"file:{id}"` の形式に正規化して保持し、
+  `idemKey = postId:stableContentId`(= `postId:image:{id}` 等)とする。
+  **構造的分離(normative)**: 識別子(`stableContentId`)とテンプレ用ブロック番号
+  (`blockOrdinal`、§5 の `$contentId` の値)は**別フィールドとして型で分離**し、
+  fantia-dl の単一 `contentId` 文字列を両用途に使い回さない(どちらも string のため、
+  取り違えても型エラーにならず「もっともらしく壊れる」移植事故を防ぐ)。
+  `FileItem` / `refetch` / ledger レコードは `stableContentId` を持ち、
+  `ContentBlock` は `blockOrdinal` を持つ。
+  **render 境界の adapter(normative)**: core の template-engine は無改造のため、
+  その入力(`RenderContext`)の `contentId` フィールド名は変えられない。そこで
+  「`blockOrdinal` → `RenderContext.contentId`」への写像を**レンダリング直前の単一の
+  adapter 関数に閉じ込める**(通常 DL・zip の両経路がこの同一 adapter を通る。
+  単体テスト必須)。`contentId` という名前が現れるのはこの adapter の出力
+  (render 呼び出しの内側)だけであり、enqueue メッセージ・ledger・refetch など
+  identity を運ぶ構造には決して現れない。`src/core/types.ts` の改変
+  (`stableContentId` / `blockOrdinal` の導入)は §17 の書き換え対象に含まれる。
   imageMap と fileMap は**別名前空間**であり、Fanbox が両者間の ID 一意性を保証する根拠は
   無いため、種別判別子で衝突を構造的に排除する(§6 の重複スキップ規則は名前空間ごとに適用)。`index`(パース順)は**ファイル名の $seq 用と整合性チェック専用**で、
-  識別には使わない。core の型(`refetch: {postId, contentId, index}`)は無改造で足りる。
+  識別には使わない。`refetch` は `{postId, stableContentId, index}` を持つ(§17 の types.ts 改変に含まれる)。
 - 署名失効こそ無いが、**投稿の再編集でファイル URL(ハッシュ名)が差し替わる**ことは
   あり得るため、fantia-dl の回復機構(`needs_page` 状態 + refetch)を**削らずそのまま残す**。
   ただし `needs_page` へ落とす前に **failure classifier(normative)** を通す:
@@ -170,7 +184,7 @@ context の組み立て(background)で以下のようにマッピングする。
   - `SERVER_*`(403/404 等 = URL 失効・編集の可能性)のみ `needs_page` に遷移
   分類器は純粋関数として実装し単体テストを必須とする。`needs_page` のジョブは、
   次にその投稿ページでボタンを押したとき post.info を再取得して回復する。回復時のファイル特定は
-  **`contentId`(安定 ID)の一致のみで行い**、再取得後の投稿に該当 ID が無ければ
+  **`stableContentId` の一致のみで行い**、再取得後の投稿に該当 ID が無ければ
   「投稿が編集され該当ファイルは存在しない」と**明示エラーにする**(ordinal で別ファイルに
   誤バインドする静かな失敗を禁止)。resume(SW 再起動時)は保存 URL の再投入を第一手とし、
   失敗したら同じ `needs_page` 経路に合流する。
@@ -198,7 +212,31 @@ README / options に注意書き)。
   として別途 spec 化してから実装する。それまで有料投稿 DL が 403 になる環境では
   明示エラーを出すに留める(静かな失敗にしない)。
 
-## 7b. zip モードのバイナリ取得(Fanbox 固有の再設計・normative)
+## 7b. zip モード(対象条件とバイナリ取得・normative)
+
+**zip の対象条件(fantia-dl の「ギャラリーのみ」規則を踏襲・normative)**:
+`zipGalleries` 設定(既定 ON)のとき、**contentType が "photo" かつファイル数 2 以上**の
+ContentBlock のみをブロック単位で 1 つの zip にまとめる(fantia-dl 実装の
+`files.length >= 2` ゲートと同一。1 枚だけの photo ブロックを one-shot zip 経路に
+落として耐久性を失う利益は無いため、**単発 photo は常に個別 DL**)。具体的には:
+- `type: "image"` 投稿の `images[]`(2 枚以上のギャラリー相当)→ 1 zip
+- `type: "article"` 内の image ブロック群(§6 で集約された photo ContentBlock、2 枚以上)→
+  **グループごとに 1 zip**(1 記事に複数グループがあれば複数 zip)
+- file / video(添付ファイル)は zip 対象外で**常に個別 DL**(fantia-dl と同一)
+**zip 不成立時のフォールバック(normative・この段落が唯一の規定)**: 事前サイズ/件数
+チェックの拒否、実行時バイトバジェット超過による中止、SW fetch 失敗など、
+**zip が成立しなかった photo ブロックは、自動的に通常の個別 DL 経路(§7a、ジョブ永続化
+あり)に enqueue し直し**、「この投稿(の一部)は zip にできないため個別ダウンロードに
+切り替えました」という**非致命の通知**を出す。ファイルが黙って欠落する終端状態を
+作らない(後述 §7b 内の「明示エラー」記述はこのフォールバック+通知を指す)。
+
+**zip 名の導出**: fantia-dl の既定 `$contentTitle.zip` は Fanbox では成立しない
+($contentTitle は常に null、§5)。`$contentId`(ブロック通し番号、§5)を使い、
+zipPathTemplate の既定を
+`fanbox/$creatorId/$date{YYYYMMDD}_$postTitle/images_$contentId.zip` とする
+(複数グループでも決定的に命名が分かれる)。zip 内エントリの既定は fantia-dl と同一
+(`[$seq{3}_]$filename.$ext`)。テンプレエンジン(core)のプレースホルダ集合は
+無改造(`$contentId` の値がブロック通し番号になるのは context 組み立て側の責務)。
 
 fantia-dl の zip 経路は MAIN-world page script が対象 URL を fetch してバイト列を得るが、
 Fanbox では `downloads.fanbox.cc` が CORS 全拒否のため**この経路は成立しない**(§4 実測)。
@@ -210,8 +248,8 @@ Fanbox では `downloads.fanbox.cc` が CORS 全拒否のため**この経路は
 - **hard gate(§13)**: 無料投稿で zip E2E(SW fetch → zip → 実保存)を MVP1 で実証する。
   有料投稿は加入後に同じ gate を再実行(§13-2 と同時)。
 - **gate 失敗時のフォールバック**: SW fetch が cookie 事情等で 403 になる場合でも、
-  通常 DL(§7a)には影響しない。zip モードのみ「この投稿では zip を利用できない」を
-  明示エラーにして無効化する(静かな空 zip を作らない)。
+  通常 DL(§7a)には影響しない。zip が成立しない場合の挙動は冒頭のフォールバック規定
+  (個別 DL への自動切替+非致命通知)に従う(静かな空 zip・黙った欠落を作らない)。
 - **durability の位置づけ(normative)**: zip モードは fantia-dl と同様
   **best-effort の one-shot 機能であり、durability 保証の対象外**とする。
   job-store による dedup / resume / `needs_page` 回復は zip には適用されない
@@ -219,9 +257,9 @@ Fanbox では `downloads.fanbox.cc` が CORS 全拒否のため**この経路は
   そのうえで最悪ケースを抑えるため:
   - **サイズ制限(二段構え)**: 上限は単一の名前付き定数 **`ZIP_SOURCE_BUDGET_BYTES`
     (既定 100MB)** とし、事前チェックと実行時バジェットの両方が**同じ値**を参照する。
-    (a) 事前チェック — サイズ既知の item(file item の `size`)の合計が
-    `ZIP_SOURCE_BUDGET_BYTES` を超える投稿は zip を開始せず「通常 DL を使って」と
-    明示エラー。件数上限(既定 100 件)も併用。
+    (a) 事前チェック — サイズ既知の item の合計が `ZIP_SOURCE_BUDGET_BYTES` を超える、
+    または件数上限(既定 100 件)を超えるブロックは zip を開始しない(冒頭の
+    フォールバック規定に従い個別 DL へ)。
     (b) **実行時バイトバジェット(normative)** — image item はサイズ不明のため、
     zip 用ソース fetch 中に累積受信バイト数を計上し、`ZIP_SOURCE_BUDGET_BYTES` を
     超えた時点で fetch を中止・部分 zip を作らず明示エラーにする。
@@ -399,7 +437,7 @@ crash window・adoption miss・tombstone 喪失時の再投入が**既存ファ�
 バージョン管理は拡張所有の `.rev{generation}` 命名(§7c-2)が担う。
 その他は fantia-dl §8, §9, §10, §13(a) と同一。core は無改造コピー。job-store は §7c の 3 点
 (URL 採用 reconcile・件数上限 prune・set 失敗の明示通知・クリア時の進行中保護)を加えた小改修。
-DL 履歴の dedup キーは `idemKey = postId:contentId`(安定 ID ベース、§6)とし、
+DL 履歴の dedup キーは `idemKey = postId:stableContentId`(安定 ID ベース、§6)とし、
   **dedup 判定は「idemKey の done レコードが存在し、かつレコードに保存された `url` と
   `relPath` の両方が、現在の post.info とテンプレートから導いた値に一致する」場合のみ
   成立**とする(JobRecord は元々 `url` と `relPath` を保持している)。
