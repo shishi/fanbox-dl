@@ -1,6 +1,6 @@
 // src/options/options.ts
 import { loadSettings, saveSettings, CONFLICT_ACTION } from "../core/settings";
-import { checkTemplate, hasBlockingTemplateError, type TemplateCheckInput } from "./validate-templates";
+import { checkTemplate, hasBlockingTemplateError, illegalReplacementError, type TemplateCheckInput } from "./validate-templates";
 import type { RenderContext, Settings } from "../core/types";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -81,6 +81,14 @@ async function init() {
     );
     if (blocking) {
       alert("テンプレートにエラーがあります。修正してください");
+      return;
+    }
+    // 最終レビュー修正 P3: illegalCharReplacement に / や \ を保存させない。
+    // core の sanitizeSegment が置換した「後」にパス区切りが新生し、adapter(P2)の
+    // 中和効果を無に帰すため、保存時点でこの置換文字列自体を拒否する。
+    const replError = illegalReplacementError(($("repl") as HTMLInputElement).value);
+    if (replError) {
+      alert(replError);
       return;
     }
     cur = {

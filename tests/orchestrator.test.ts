@@ -206,4 +206,27 @@ describe("orchestrator (SW 層の spec 契約)", () => {
     expect(rec.error).toContain("未加入の有料コンテンツの可能性");
     expect(rec.refusedUrl).toBe(url);
   });
+
+  it("永続化された illegalCharReplacement が / や \\ を含んでいても(旧バージョンからの引き継ぎ・他ブラウザ同期等)、production の render 経路でパス区切りが新生しない (codex レビュー指摘 P2 round3-2: options.ts の保存ガードは新規保存しか防がない)", async () => {
+    // postTitle に含まれる ":" は core の ILLEGAL 文字集合に入っており、
+    // sanitizeSegment が illegalCharReplacement で置換する。置換文字列自体が "/" だと、
+    // (adapter の中和は creator/postTitle 等の値そのものの / \ にしか効かないため)
+    // 置換後に新しいディレクトリ境界が生まれてしまう。
+    const jsonWithColon = { body: { post: {
+      id: "1", title: "A:B", feeRequired: 0, publishedDatetime: "2026-07-01T00:00:00+09:00",
+      updatedDatetime: "2026-07-02T00:00:00+09:00", isRestricted: false,
+      user: { userId: "9", name: "C" }, creatorId: "s", type: "image",
+      body: { text: "", images: [img("a")] },
+    } } };
+    const { deps, store } = mkDeps({
+      loadSettings: async () => ({ ...DEFAULT_SETTINGS, illegalCharReplacement: "/" }),
+      zip: { eligible: () => false, collect: async () => ({ ok: false, error: "x" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) },
+    });
+    const o = createOrchestrator(deps);
+    await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: jsonWithColon });
+    const rec = Object.values((await store.read()).jobs)[0];
+    const expectedSegments = DEFAULT_SETTINGS.pathTemplate.split("/").length;
+    expect(rec.relPath.split("/").length).toBe(expectedSegments); // 余計なサブフォルダが増えない
+    expect(rec.relPath).not.toContain(":"); // 置換自体は行われている
+  });
 });

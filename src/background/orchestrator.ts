@@ -4,7 +4,7 @@ import { validatePath } from "../core/path-validator";
 import { validateMediaUrl } from "../core/url-allowlist";
 import { parsePost, emptyPostNotice } from "../fanbox/parse";
 import { validatePostInfo } from "../fanbox/api";
-import { buildRenderContext } from "./render-adapter";
+import { buildRenderContext, neutralizePathSeparators } from "./render-adapter";
 import { classifyDownloadError } from "./failure-classifier";
 import { findAdoptable } from "./adoption";
 import {
@@ -140,7 +140,14 @@ export function createOrchestrator(deps: OrchestratorDeps): {
       return finish();
     }
 
-    const s = await deps.loadSettings();
+    // 最終レビュー修正 P2 round3-2(codex 指摘): options.ts の保存ガード(illegalReplacementError)は
+    // 新規保存しか防がず、旧バージョンからの引き継ぎや他ブラウザ同期で既に永続化された
+    // illegalCharReplacement に / や \ が残っている場合、production の render 経路
+    // (renderTemplate -> sanitizeSegment)がその不正な置換文字列で illegal 文字を置換し、
+    // adapter(P2)の中和済みの値の中に新しいパス区切りを作ってしまう。
+    // core(sanitizeSegment)は無改造のまま、実際に使う直前でこの一点だけ中和する。
+    const loaded = await deps.loadSettings();
+    const s: Settings = { ...loaded, illegalCharReplacement: neutralizePathSeparators(loaded.illegalCharReplacement) };
     const now = new Date(deps.now());
     const vp = mkValidatePath(s);
 

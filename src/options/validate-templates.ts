@@ -53,3 +53,16 @@ export function hasBlockingTemplateError(
   if (!zip.zipModeActive) return false;
   return checkTemplate(zip.zipPath).error !== "" || checkTemplate(zip.zipEntry).error !== "";
 }
+
+// 最終レビュー修正 P3: illegalCharReplacement に / や \ を保存できてしまうと、
+// core の sanitizeSegment が不正文字を置換した「後」にパス区切りが新生してしまい、
+// P2 で adapter が中和した効果を無に帰す(かつ traversal のリスクを再度招く)。
+// 保存前にこの置換文字列自体を拒否する。空文字は options.ts 側で "_" に
+// フォールバックする契約があるため、ここではエラー扱いにしない。
+export function illegalReplacementError(rep: string): string | null {
+  if (rep === "") return null;
+  if (rep.includes("/") || rep.includes("\\")) {
+    return "置換文字に / や \\ は使えません";
+  }
+  return null;
+}

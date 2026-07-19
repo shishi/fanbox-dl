@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { checkTemplate, hasTemplateError, hasBlockingTemplateError, type TemplateCheckInput } from "../src/options/validate-templates";
+import { checkTemplate, hasTemplateError, hasBlockingTemplateError, illegalReplacementError, type TemplateCheckInput } from "../src/options/validate-templates";
 import type { RenderContext } from "../src/core/types";
 
 const ctx: RenderContext = {
@@ -56,5 +56,34 @@ describe("checkTemplate / hasTemplateError (options save ガードの純粋ロ�
     it("すべて正常ならブロックしない", () => {
       expect(hasBlockingTemplateError(ok, { zipModeActive: true, zipPath: ok, zipEntry: ok })).toBe(false);
     });
+  });
+});
+
+describe("illegalReplacementError (最終レビュー修正 P3: illegalCharReplacement に / や \\ を保存させない)", () => {
+  it("/ を含む置換文字列はエラー", () => {
+    expect(illegalReplacementError("a/b")).not.toBeNull();
+  });
+
+  it("\\ を含む置換文字列はエラー", () => {
+    expect(illegalReplacementError("a\\b")).not.toBeNull();
+  });
+
+  it("/ のみもエラー", () => {
+    expect(illegalReplacementError("/")).not.toBeNull();
+  });
+
+  it("通常の置換文字(_ や -)は OK(null)", () => {
+    expect(illegalReplacementError("_")).toBeNull();
+    expect(illegalReplacementError("-")).toBeNull();
+  });
+
+  it("空文字は options.ts 側で '_' にフォールバックされる契約のため OK(null)", () => {
+    expect(illegalReplacementError("")).toBeNull();
+  });
+
+  it("エラーメッセージは日本語の説明文字列", () => {
+    const err = illegalReplacementError("/");
+    expect(typeof err).toBe("string");
+    expect(err).toMatch(/[ぁ-んァ-ヶ一-龠]/);
   });
 });
