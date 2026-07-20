@@ -1,4 +1,4 @@
-import type { PostData, ContentBlock, FileItem } from "../core/types";
+import type { PostData, FileItem } from "../core/types";
 
 const VIDEO_EXT = new Set(["mp4", "mov", "m4v", "webm", "avi", "mkv"]);
 
@@ -18,8 +18,6 @@ function imageToItem(im: RawImage): Omit<FileItem, "seq" | "total"> {
     url: im.originalUrl,
     filename: urlBasenameNoExt(im.originalUrl),
     ext: (im.extension || "").toLowerCase(),
-    idemKey: "", stableContentId: `image:${im.id}`,
-    refetch: { postId: "", stableContentId: `image:${im.id}`, index: 0 },
   };
 }
 
@@ -31,8 +29,6 @@ function fileToItem(f: RawFile): Omit<FileItem, "seq" | "total"> {
     filename: f.name ?? null,
     ext,
     size: typeof f.size === "number" ? f.size : undefined,
-    idemKey: "", stableContentId: `file:${f.id}`,
-    refetch: { postId: "", stableContentId: `file:${f.id}`, index: 0 },
   };
 }
 
@@ -57,7 +53,6 @@ export function parsePost(json: any): PostData {
     creatorId: post.creatorId ?? "",
     fee: typeof post.feeRequired === "number" ? post.feeRequired : 0,
     publishedAt: new Date(post.publishedDatetime ?? 0),
-    updatedAtIso: post.updatedDatetime ?? "",
     restricted,
     postType: post.type ?? "",
     skippedEmbeds: 0,
@@ -99,22 +94,18 @@ export function parsePost(json: any): PostData {
   // text / video(外部埋め込み) / 未知 type は groups 空のまま
 
   let ordinal = 0;
-  let parseIndex = 0; // spec §6: refetch.index は投稿全体のパース順(整合性チェック専用)
   for (const g of groups) {
     ordinal++;
     const files: FileItem[] = g.items.map((it, i) => ({
       ...it,
       seq: i + 1,
       total: g.items.length,
-      idemKey: `${postId}:${it.stableContentId}`,
-      refetch: { postId, stableContentId: it.stableContentId, index: parseIndex++ },
     }));
-    const block: ContentBlock = {
+    data.contents.push({
       blockOrdinal: ordinal,
       contentType: g.kind === "image" ? "photo" : "file",
       files,
-    };
-    data.contents.push(block);
+    });
   }
   return data;
 }

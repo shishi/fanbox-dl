@@ -3,7 +3,7 @@ import { fetchPostInfo } from "../fanbox/api";
 
 const CONTAINER_ID = "fbxdl-btn-container";
 
-async function runDownload(force: boolean): Promise<DownloadResponse | null> {
+async function runDownload(): Promise<DownloadResponse | null> {
   const postId = postIdFromPathname(location.pathname);
   if (!postId) { alert("[fanbox-dl] postId 不明"); return null; }
   // spec §4a: post.info は content script(isolated world)が fetch する。
@@ -12,7 +12,7 @@ async function runDownload(force: boolean): Promise<DownloadResponse | null> {
   const fetched = await fetchPostInfo(postId);
   if (!fetched.ok) { alert(`[fanbox-dl] 取得失敗: ${fetched.error}`); return null; }
   const res = (await chrome.runtime.sendMessage({
-    kind: "download", postId, force, json: fetched.json,
+    kind: "download", postId, json: fetched.json,
   } satisfies DownloadRequestMessage)) as DownloadResponse | undefined;
   if (!res) { alert("[fanbox-dl] background から応答がありません"); return null; }
   if (res.errors.length) alert(`[fanbox-dl] エラー: ${res.errors.join(" / ")}`);
@@ -47,7 +47,7 @@ function addButton() {
   styleBtn(btn);
   btn.addEventListener("click", () => {
     btn.disabled = true;
-    runDownload(false).then((r) => {
+    runDownload().then((r) => {
       if (r) swapText(btn, `⬇ ${r.queued + r.zipQueued} 件開始`);
       else btn.disabled = false;
     }).catch(() => { btn.disabled = false; });
@@ -60,7 +60,7 @@ function addButton() {
   retryBtn.addEventListener("click", () => {
     if (!confirm("この投稿を再ダウンロードします(旧ファイルは消えません)。よろしいですか?")) return;
     retryBtn.disabled = true;
-    runDownload(true).then((r) => {
+    runDownload().then((r) => {
       if (r) swapText(retryBtn, `🔄 ${r.queued + r.zipQueued} 件`);
       else retryBtn.disabled = false;
     }).catch(() => { retryBtn.disabled = false; });

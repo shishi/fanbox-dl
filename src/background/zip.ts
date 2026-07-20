@@ -50,7 +50,7 @@ function realBinFetch(url: string, init?: RequestInit): Promise<ChunkedResponse>
 }
 
 export async function collectZipSources(
-  files: Array<{ url: string; idemKey: string; size?: number }>, postId: string,
+  files: Array<{ url: string; size?: number }>, postId: string,
   deps: { fetchFn?: BinFetch; budget?: number } = {},
 ): Promise<{ ok: true; buffers: Map<string, Uint8Array> } | { ok: false; error: string }> {
   const fetchFn = deps.fetchFn ?? realBinFetch;
@@ -85,7 +85,7 @@ export async function collectZipSources(
     const buf = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
     let off = 0;
     for (const p of parts) { buf.set(p, off); off += p.byteLength; }
-    buffers.set(f.idemKey, buf);
+    buffers.set(f.url, buf);
   }
   return { ok: true, buffers };
 }
@@ -96,10 +96,10 @@ export function buildZip(
   const entries: Record<string, Uint8Array> = {};
   const usedNames = new Set<string>();
   for (const f of block.files) {
-    const buf = buffers.get(f.idemKey);
+    const buf = buffers.get(f.url);
     // spec §7b: 黙った欠落の禁止。ソースが揃っていない zip は組み立てず error にして
     // 呼び出し側の個別 DL フォールバックに乗せる。
-    if (!buf) throw new Error(`zip ソース欠落: ${f.idemKey}`);
+    if (!buf) throw new Error(`zip ソース欠落: ${f.url}`);
     const ctx = buildRenderContext(post, block, f, now);
     let entryPath = renderTemplate(s.zipEntryTemplate, ctx, { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen });
     // テンプレが $seq を含まない等の衝突 -> 静かな上書きを防ぐため連番(fantia-dl と同一規則)

@@ -5,15 +5,13 @@ import type { PostData, ContentBlock, FileItem } from "../src/core/types";
 const post: PostData = {
   postId: "111", postTitle: "T", creator: "C", creatorId: "slug",
   fee: 500, publishedAt: new Date("2026-07-01T03:00:00Z"),
-  updatedAtIso: "2026-07-02T12:00:00+09:00", restricted: false, postType: "image",
+  restricted: false, postType: "image",
   skippedEmbeds: 0,
   contents: [],
 };
 const item: FileItem = {
   contentType: "photo", url: "https://downloads.fanbox.cc/images/post/111/a.jpeg",
   filename: "a", ext: "jpeg", seq: 2, total: 3,
-  idemKey: "111:image:a", stableContentId: "image:a",
-  refetch: { postId: "111", stableContentId: "image:a", index: 1 },
 };
 const block: ContentBlock = { blockOrdinal: 4, contentType: "photo", files: [item] };
 

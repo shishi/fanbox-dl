@@ -21,22 +21,20 @@ const fil = (id: string, name: string, ext: string) => ({
 });
 
 describe("parsePost", () => {
-  it("image 投稿: 1 photo ブロックに images[] 順で格納、identity は image:{id}", () => {
+  it("image 投稿: 1 photo ブロックに images[] 順で格納", () => {
     const p = parsePost(wrap({ ...base, type: "image", body: { text: "", images: [img("a"), img("b")] } }));
     expect(p.postId).toBe("111");
     expect(p.fee).toBe(500);
-    expect(p.updatedAtIso).toBe("2026-07-02T12:00:00+09:00");
     expect(p.contents).toHaveLength(1);
     const b = p.contents[0];
     expect(b.blockOrdinal).toBe(1);
     expect(b.contentType).toBe("photo");
-    expect(b.files.map(f => f.stableContentId)).toEqual(["image:a", "image:b"]);
-    expect(b.files.map(f => f.idemKey)).toEqual(["111:image:a", "111:image:b"]);
+    expect(b.files.map(f => f.contentType)).toEqual(["photo", "photo"]);
     expect(b.files[0].seq).toBe(1);
     expect(b.files[0].total).toBe(2);
     expect(b.files[0].filename).toBe("a"); // image は URL basename(ハッシュ)
     expect(b.files[0].url).toContain("/images/post/111/a.jpeg");
-    expect(b.files[0].refetch).toEqual({ postId: "111", stableContentId: "image:a", index: 0 });
+    expect(b.files[1].url).toContain("/images/post/111/b.jpeg");
   });
 
   it("file 投稿: 拡張子で video/file を判定", () => {
@@ -46,7 +44,7 @@ describe("parsePost", () => {
     expect(files[0].contentType).toBe("video");
     expect(files[1].contentType).toBe("file");
     expect(files[0].filename).toBe("movie");
-    expect(files[0].stableContentId).toBe("file:f1");
+    expect(files[0].url).toContain("/files/post/111/f1.mp4");
     expect(files[0].size).toBe(10); // zip 事前サイズチェック用に保持(spec §7b)
   });
 
@@ -69,10 +67,8 @@ describe("parsePost", () => {
     }));
     expect(p.contents.map(b => b.contentType)).toEqual(["photo", "file", "photo"]);
     expect(p.contents.map(b => b.blockOrdinal)).toEqual([1, 2, 3]);
-    expect(p.contents[0].files.map(f => f.stableContentId)).toEqual(["image:a", "image:b"]);
-    expect(p.contents[2].files.map(f => f.stableContentId)).toEqual(["image:c"]);
-    // refetch.index は投稿全体のパース順(ブロックごとにリセットしない。spec §6)
-    expect(p.contents.flatMap(b => b.files).map(f => f.refetch.index)).toEqual([0, 1, 2, 3]);
+    expect(p.contents[0].files.map(f => f.url)).toEqual([img("a").originalUrl, img("b").originalUrl]);
+    expect(p.contents[2].files.map(f => f.url)).toEqual([img("c").originalUrl]);
   });
 
   it("必須フィクスチャ1: 同じ imageId の非連続 2 回出現は初出のみ採用 (spec §14-1)", () => {
@@ -89,11 +85,12 @@ describe("parsePost", () => {
       },
     }));
     const all = p.contents.flatMap(b => b.files);
-    expect(all.map(f => f.stableContentId)).toEqual(["image:a", "image:b"]);
+    // url が重複しない(同じ image が 2 回 DL キューに乗らない)
+    const urls = all.map(f => f.url);
+    expect(new Set(urls).size).toBe(urls.length);
+    expect(urls).toEqual([img("a").originalUrl, img("b").originalUrl]);
     expect(all[1].seq).toBe(2);
     expect(all[1].total).toBe(2); // スキップ後のユニーク列に対して振る
-    const keys = all.map(f => f.idemKey);
-    expect(new Set(keys).size).toBe(keys.length);
   });
 
   it("必須フィクスチャ1b: imageId と fileId が同一文字列でも別ジョブとして共存 (spec §14-1b)", () => {
@@ -106,7 +103,11 @@ describe("parsePost", () => {
       },
     }));
     const all = p.contents.flatMap(b => b.files);
-    expect(all.map(f => f.idemKey)).toEqual(["111:image:same", "111:file:same"]);
+    expect(all).toHaveLength(2);
+    expect(all[0].contentType).toBe("photo");
+    expect(all[0].url).toBe(img("same").originalUrl);
+    expect(all[1].contentType).toBe("file");
+    expect(all[1].url).toBe(fil("same", "n", "zip").url);
   });
 
   it("制限付き投稿(body null)は contents 空 + restricted", () => {

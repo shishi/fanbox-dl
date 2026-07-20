@@ -1,24 +1,18 @@
 // src/core/types.ts
 export type ContentType = "photo" | "file" | "video";
 
-// identity(stableContentId)とテンプレ用ブロック番号(blockOrdinal)は
-// 型レベルで分離する(spec §6 構造的分離)。どちらも string/number だが、
-// contentId という名前は render adapter の出力(RenderContext)にしか現れない。
 export interface FileItem {
   contentType: ContentType;
-  url: string;               // downloads.fanbox.cc の直 URL(署名なし・期限なし)
-  filename: string | null;   // file: name(人間可読・拡張子なし) / image: URL basename(ハッシュ)
-  ext: string;               // 拡張子(ドットなし)。API の extension を正とする
-  size?: number;             // file item のみ API が返す(zip 事前サイズチェック用 spec §7b)
-  seq: number;               // ブロック内 1-based(重複スキップ後の連番)
+  url: string;               // downloads.fanbox.cc の直 URL(zip の buffers キーにも使う=post 内で一意)
+  filename: string | null;   // file: name(拡張子なし) / image: URL basename(ハッシュ)
+  ext: string;               // 拡張子(ドットなし)
+  size?: number;             // file item のみ(zip 事前サイズチェック用)
+  seq: number;               // ブロック内 1-based(重複スキップ後)
   total: number;             // ブロック内総数(重複スキップ後)
-  idemKey: string;           // "postId:stableContentId"
-  stableContentId: string;   // "image:{id}" | "file:{id}"(imageMap/fileMap は別名前空間)
-  refetch: { postId: string; stableContentId: string; index: number };
 }
 
 export interface ContentBlock {
-  blockOrdinal: number;      // post 内 1-based 通し番号($contentId の値になる。識別子ではない)
+  blockOrdinal: number;      // post 内 1-based 通し番号($contentId の値。識別子ではない)
   contentType: ContentType;
   files: FileItem[];
 }
@@ -30,7 +24,6 @@ export interface PostData {
   creatorId: string;         // creatorId(人間可読スラグ)
   fee: number;               // feeRequired($plan は String(fee))
   publishedAt: Date;         // publishedDatetime
-  updatedAtIso: string;      // updatedDatetime(鮮度シグナル。spec §8)
   restricted: boolean;       // isRestricted / body:null
   postType: string;          // "image" | "file" | "article" | "text" | 未知
   skippedEmbeds: number;     // embed/url_embed/未知メディアブロックの件数(spec §2: 対象外・通知のみ)

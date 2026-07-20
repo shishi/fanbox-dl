@@ -23,8 +23,7 @@ vi.mock("../src/core/template-engine", async (importOriginal) => {
 
 const item = (id: string): FileItem => ({
   contentType: "photo", url: `https://downloads.fanbox.cc/images/post/1/${id}.jpg`,
-  filename: id, ext: "jpg", seq: 1, total: 1, idemKey: `1:image:${id}`,
-  stableContentId: `image:${id}`, refetch: { postId: "1", stableContentId: `image:${id}`, index: 0 },
+  filename: id, ext: "jpg", seq: 1, total: 1,
 });
 const block = (n: number): ContentBlock => ({
   blockOrdinal: 1, contentType: "photo",
@@ -65,13 +64,13 @@ describe("collectZipSources (spec §7b バジェット)", () => {
     return { resp, state };
   };
   it("直列 fetch して buffers を返す", async () => {
-    const r = await collectZipSources(block(2).files, "1", { fetchFn: async () => chunked([10]).resp });
+    const r = await collectZipSources(block(2).files.map((f) => ({ url: f.url, size: f.size })), "1", { fetchFn: async () => chunked([10]).resp });
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.buffers.size).toBe(2);
   });
   it("累積バイトが budget を超えた時点で abort して中止 error(読み切らない) (spec §7b)", async () => {
     const states: Array<{ aborted: boolean; yielded: number }> = [];
-    const r = await collectZipSources(block(1).files, "1", {
+    const r = await collectZipSources(block(1).files.map((f) => ({ url: f.url, size: f.size })), "1", {
       fetchFn: async () => { const { resp, state } = chunked([60, 60, 60]); states.push(state); return resp; },
       budget: 100,
     });
@@ -83,7 +82,7 @@ describe("collectZipSources (spec §7b バジェット)", () => {
   });
   it("事前チェック: 既知サイズ合計が budget 超過なら 1 バイトも fetch せず error (spec §7b(a))", async () => {
     let called = 0;
-    const files = block(2).files.map((f, i) => ({ ...f, size: 80 }));
+    const files = block(2).files.map((f) => ({ url: f.url, size: 80 }));
     const r = await collectZipSources(files, "1", { fetchFn: async () => { called++; return chunked([1]).resp; }, budget: 100 });
     expect(r.ok).toBe(false);
     expect(called).toBe(0);
@@ -91,34 +90,43 @@ describe("collectZipSources (spec §7b バジェット)", () => {
 
   it("件数上限超過は fetch せず即 error", async () => {
     let called = 0;
-    const files = Array.from({ length: ZIP_MAX_FILES + 1 }, (_, i) => item(`f${i}`));
+    const files = Array.from({ length: ZIP_MAX_FILES + 1 }, (_, i) => ({ url: item(`f${i}`).url, size: undefined }));
     const r = await collectZipSources(files, "1", { fetchFn: async () => { called++; return chunked([1]).resp; } });
     expect(r.ok).toBe(false);
     expect(called).toBe(0);
   });
   it("allowlist 違反 URL は fetch せず error (spec §4a: zip ソース fetch も対象)", async () => {
-    const bad = { ...item("x"), url: "https://evil.example.com/images/post/1/x.jpg" };
+    const bad = { url: "https://evil.example.com/images/post/1/x.jpg", size: undefined };
     const r = await collectZipSources([bad], "1", { fetchFn: async () => chunked([1]).resp });
     expect(r.ok).toBe(false);
   });
   it("fetch 失敗(403 等)は error", async () => {
-    const r = await collectZipSources(block(2).files, "1", { fetchFn: async () => chunked([], 403).resp });
+    const r = await collectZipSources(block(2).files.map((f) => ({ url: f.url, size: f.size })), "1", { fetchFn: async () => chunked([], 403).resp });
     expect(r.ok).toBe(false);
   });
   it("既定 budget は 100MB", () => {
     expect(ZIP_SOURCE_BUDGET_BYTES).toBe(100 * 1024 * 1024);
+  });
+  it("zip ソース fetch は credentials:include かつ redirect:error で呼ぶ (spec §4a-3)", async () => {
+    let seenInit: RequestInit | undefined;
+    const r = await collectZipSources(block(1).files.map((f) => ({ url: f.url, size: f.size })), "1", {
+      fetchFn: async (_u, init) => { seenInit = init; return chunked([1]).resp; },
+    });
+    expect(r.ok).toBe(true);
+    expect(seenInit?.redirect).toBe("error");
+    expect(seenInit?.credentials).toBe("include");
   });
 });
 
 describe("buildZip (spec §7b 黙った欠落の禁止)", () => {
   const post = {
     postId: "1", postTitle: "T", creator: "C", creatorId: "s", fee: 0,
-    publishedAt: new Date("2026-07-01T00:00:00Z"), updatedAtIso: "", restricted: false,
+    publishedAt: new Date("2026-07-01T00:00:00Z"), restricted: false,
     postType: "image", skippedEmbeds: 0, contents: [],
   } as any;
   it("ソース buffer が欠けていたら throw(呼び出し側の個別 DL フォールバックに乗せる)", () => {
     const b = block(2);
-    const buffers = new Map([[b.files[0].idemKey, new Uint8Array(1)]]); // 2 本目が欠落
+    const buffers = new Map([[b.files[0].url, new Uint8Array(1)]]); // 2 本目が欠落
     expect(() => buildZip(post, b, buffers, DEFAULT_SETTINGS, new Date())).toThrow(/欠落/);
   });
   it("エントリ名衝突は ' (n)' 連番で回避される(静かな上書き禁止)", () => {
@@ -126,7 +134,7 @@ describe("buildZip (spec §7b 黙った欠落の禁止)", () => {
     // $seq を含まないテンプレで両ファイルが同名になる状況を作る
     const s = { ...DEFAULT_SETTINGS, zipEntryTemplate: "$filename.$ext" };
     b.files = b.files.map((f) => ({ ...f, filename: "same" }));
-    const buffers = new Map(b.files.map((f) => [f.idemKey, new Uint8Array(1)]));
+    const buffers = new Map(b.files.map((f) => [f.url, new Uint8Array(1)]));
     const { bytes } = buildZip(post, b, buffers, s, new Date());
     // fantia-dl と同一の " (n)" 規則をエントリ名で直接検証する
     const entries = Object.keys(unzipSync(bytes));
@@ -135,7 +143,7 @@ describe("buildZip (spec §7b 黙った欠落の禁止)", () => {
   it("entryPath が ../ を含むと buildZip が throw する(実行時検証・fail-closed) (最終レビュー round5 P2c)", () => {
     const b = block(1);
     const s = { ...DEFAULT_SETTINGS, zipEntryTemplate: MALICIOUS_ENTRY_TEMPLATE };
-    const buffers = new Map(b.files.map((f) => [f.idemKey, new Uint8Array(1)]));
+    const buffers = new Map(b.files.map((f) => [f.url, new Uint8Array(1)]));
     expect(() => buildZip(post, b, buffers, s, new Date())).toThrow(/entryPath|不正/);
   });
   it("entryPath の実行時検証はダウンロードパスの uniquify headroom を誤って流用しない(zip 内エントリ名は browser の uniquify 対象外) (codex レビュー round5 指摘)", () => {
@@ -145,7 +153,7 @@ describe("buildZip (spec §7b 黙った欠落の禁止)", () => {
     const b = block(1);
     const longFilename = "a".repeat(DEFAULT_SETTINGS.fullPathMaxLen - 4); // + ".jpg" で fullPathMaxLen ちょうど
     b.files = b.files.map((f) => ({ ...f, filename: longFilename }));
-    const buffers = new Map(b.files.map((f) => [f.idemKey, new Uint8Array(1)]));
+    const buffers = new Map(b.files.map((f) => [f.url, new Uint8Array(1)]));
     expect(() => buildZip(post, b, buffers, DEFAULT_SETTINGS, new Date())).not.toThrow();
   });
 });

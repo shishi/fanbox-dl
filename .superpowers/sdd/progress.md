@@ -26,3 +26,4 @@ Final review rounds 5-6: P2 tail(blocker 無し・P1/Critical は rounds 1-4 で
   - P2a orchestrator.ts fire-and-forget startDownload(retry_once/reconcile): MV3 SW suspend で稀に pending 取りこぼし。起動時 reconcile/次クリックで回復可(非 core・修正可)
   - P2b template-engine.ts fmtDate が local-time getter → $date のタイムゾーン差でマシン間 relPath/dedup ズレ。**unmodified core(fantia-dl 由来)・core 無改造制約と衝突・shishi 判断**
 Task 5(subagent 実装): 全16タスク完了・194 tests・build 4-entry。手動 E2E ゲート待ち。P2 tail は post-MVP backlog(P2a fire-and-forget / P2b $date TZ core)
+=== 変更フェーズ開始(履歴撤去+ボタン)base f67156f ===
