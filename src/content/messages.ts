@@ -13,7 +13,4 @@ export interface DownloadResponse {
   errors: string[];
 }
 
-// /posts/{id}(サブドメイン形式)と /@{slug}/posts/{id}(www 形式)の両対応
-export function postIdFromPathname(pathname: string): string | null {
-  return pathname.match(/\/posts\/(\d+)(?:$|\/)/)?.[1] ?? null;
-}
+export { postIdFromPathname } from "./dom-helpers";
