@@ -14,6 +14,14 @@ import type { Settings } from "../core/types";
 // リダイレクト検出だけ downloadId→postId の揮発 Map + onChanged で軽量維持(fail-closed)。
 const REDIRECT_MAP_KEY = "redirectMap";
 
+// 最終レビュー修正 P2(round2): options.ts の保存ガード(illegalReplacementError)は
+// 新規保存だけを防ぐため、旧同期設定に '/' '\' や空文字がそのまま残っている
+// ケースは実行時にここで中和する。renderTemplate に渡す前の最後の砦。
+export function safeReplacement(rep: string): string {
+  if (rep === "" || rep.includes("/") || rep.includes("\\")) return "_";
+  return rep;
+}
+
 export interface OrchestratorDeps {
   downloads: {
     download(opts: chrome.downloads.DownloadOptions): Promise<number>;
@@ -51,10 +59,42 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     writeChain = writeChain.then(next, next);
     return writeChain as Promise<void>;
   }
-  async function loadRedirectMap(): Promise<void> {
+
+  // 最終レビュー修正 P1b: SW 起動レース対策。loadRedirectMap() は複数回・複数
+  // 経路(service-worker.ts の起動ブロックと handleDownloadChanged からの
+  // ensureLoaded)から呼ばれ得るが、実際のロードは 1 回だけにする(冪等)。
+  // codex-review 指摘(2/3 巡目): session.get() が一時的に失敗した場合、
+  // (a) readyPromise を rejected のまま恒久キャッシュしない(次回呼び出しで
+  //     再試行できるよう null に戻す)。
+  // (b) それでも「読み込み失敗 = 検証スキップ」は persist 済み(in-memory に
+  //     無い)downloadId の fail-closed を取りこぼし得るため、諦める前に
+  //     短い遅延を挟んで数回リトライし、純粋な一過性の失敗はここで吸収する
+  //     (恒久的な storage 障害まではカバーできないが、その場合 SW 自体が
+  //     機能不全であり許容する)。
+  const SESSION_GET_RETRY_DELAYS_MS = [20, 60];
+  async function loadRedirectMapOnce(): Promise<void> {
     const r = await deps.session.get(REDIRECT_MAP_KEY);
     const obj = (r?.[REDIRECT_MAP_KEY] as Record<string, string>) ?? {};
     for (const [id, postId] of Object.entries(obj)) redirect.set(Number(id), postId);
+  }
+  async function loadRedirectMapWithRetry(): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try { await loadRedirectMapOnce(); return; }
+      catch (e) {
+        if (attempt >= SESSION_GET_RETRY_DELAYS_MS.length) throw e;
+        await new Promise((r) => setTimeout(r, SESSION_GET_RETRY_DELAYS_MS[attempt]));
+      }
+    }
+  }
+  let readyPromise: Promise<void> | null = null;
+  function loadRedirectMap(): Promise<void> {
+    if (!readyPromise) {
+      readyPromise = loadRedirectMapWithRetry().catch((e) => { readyPromise = null; throw e; });
+    }
+    return readyPromise;
+  }
+  function ensureLoaded(): Promise<void> {
+    return loadRedirectMap();
   }
 
   const mkValidatePath = (s: Settings) => (relPath: string): string | null => {
@@ -85,6 +125,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     }
 
     const s = await deps.loadSettings();
+    // 最終レビュー修正 P2(round2): 旧同期設定の illegalCharReplacement が
+    // '/' '\' や空文字のままだと renderTemplate でパス区切りが新生し得るため、
+    // 使用前に安全な既定値へ中和する(zip.eligible/build にもこの s を渡すため
+    // ここで一度中和すれば個別 DL・zip 両方に効く)。
+    s.illegalCharReplacement = safeReplacement(s.illegalCharReplacement);
     const now = new Date(deps.now());
     const vp = mkValidatePath(s);
 
@@ -136,6 +181,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   async function handleDownloadChanged(delta: chrome.downloads.DownloadDelta): Promise<void> {
+    // 最終レビュー修正 P1b: SW 起動直後、loadRedirectMap() 完了前に onChanged が
+    // 発火すると redirect map が空で finalUrl 検証が永久にスキップされ得る。
+    // ここで必ずロード完了を待ってから map を参照する(冪等)。
+    // codex-review 指摘(2 巡目): ここで失敗を無条件に伝播すると、当セッション中に
+    // 既に in-memory 登録済みの downloadId(startDownload が同期的に redirect.set
+    // 済み)まで巻き添えで検証をスキップしてしまう(一発勝負の complete イベントを
+    // 逃す)。読み込み失敗は無視して in-memory map で処理を続行する
+    // (readyPromise は失敗時に null へ戻すので次回呼び出しで再試行される)。
+    try { await ensureLoaded(); } catch { /* 一時的な session 読み込み失敗: in-memory map で継続 */ }
     if (!delta.state || delta.id === undefined) return;
     const cur = delta.state.current;
     if (cur !== "complete" && cur !== "interrupted") return;

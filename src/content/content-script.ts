@@ -50,9 +50,17 @@ function findTitleAnchor(): HTMLElement | null {
   }
   return null;
 }
-function placePostButton(postId: string) {
+// 最終レビュー修正 P1a: 投稿ページボタンの click は、生成時にクロージャで
+// 握った postId ではなく、クリック時点の location.pathname から都度読む。
+// post→post の SPA 遷移では既存ボタンが再利用され続ける(早期 return)ため、
+// クロージャの postId を握ったままだと旧投稿がずっと DL されてしまう。
+// カードボタン(injectListButtons)は各カード固有の postId を握ったままで正しいので対象外。
+function placePostButton() {
   if (document.getElementById(POST_CONTAINER_ID)) return;
-  const btn = makeDlButton("⬇ fanbox-dl", false, () => runDownloadFor(postId));
+  const btn = makeDlButton("⬇ fanbox-dl", false, () => {
+    const currentPostId = postIdFromPathname(location.pathname);
+    return currentPostId ? runDownloadFor(currentPostId) : Promise.resolve(null);
+  });
   btn.id = POST_CONTAINER_ID;
   const title = findTitleAnchor();
   if (title && title.parentElement) {
@@ -96,7 +104,7 @@ function sync() {
   const onList = isCreatorPostListPage(path, location.host);
   // 投稿ページ用ボタンは詳細ページ以外では消す
   if (!onPost) document.getElementById(POST_CONTAINER_ID)?.remove();
-  if (onPost) whenReady(() => placePostButton(postIdFromPathname(path)!));
+  if (onPost) whenReady(() => placePostButton());
   if (onList) injectListButtons();
 }
 function watch() {

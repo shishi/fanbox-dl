@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createOrchestrator, type OrchestratorDeps } from "../src/background/orchestrator";
+import { createOrchestrator, safeReplacement, type OrchestratorDeps } from "../src/background/orchestrator";
 import { DEFAULT_SETTINGS } from "../src/core/settings";
 
 const img = (id: string, postId = "1") => ({ id, extension: "jpeg", width: 1, height: 1, originalUrl: `https://downloads.fanbox.cc/images/post/${postId}/${id}.jpeg`, thumbnailUrl: `https://downloads.fanbox.cc/images/post/${postId}/t${id}.jpeg` });
@@ -139,4 +139,80 @@ describe("orchestrator fire-and-forget", () => {
     const saved = (mem["redirectMap"] ?? {}) as Record<string, string>;
     expect(Object.values(saved).sort()).toEqual(["1", "2"]);
   });
+
+  it("SW 起動レース: loadRedirectMap を呼ぶ前に handleDownloadChanged が来ても、session の保存済みマップを読み込んでから finalUrl 検証する(fail-closed)", async () => {
+    // 前インスタンスが persist した redirect map が既に session に残っている状況を模す。
+    const mem: Record<string, unknown> = { redirectMap: { "101": "1" } };
+    const { deps, removed, erased, setSearch } = mkDeps({
+      session: {
+        get: async (k) => ({ [k]: mem[k] }),
+        set: async (items) => { Object.assign(mem, items); },
+      },
+    });
+    setSearch(async () => [{ id: 101, url: "https://downloads.fanbox.cc/images/post/1/a.jpeg", finalUrl: "https://evil.example.com/x.jpeg" } as any]);
+    const o = createOrchestrator(deps);
+    // わざと loadRedirectMap() を呼ばない(SW 再起動直後、ロード未完了を模倣)。
+    await o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
+    expect(removed).toContain(101);
+    expect(erased).toContain(101);
+  });
+
+  it("codex-review 指摘(2 巡目): redirect-map 再読み込みが持続的に失敗(内部リトライも尽きる)しても (a) 当セッション中に in-memory 登録済みの DL は fail-closed 検証を続行し、(b) 失敗をキャッシュせず障害解消後の呼び出しで再読み込みを試みる", async () => {
+    const mem: Record<string, unknown> = {};
+    let failLoads = true;
+    const { deps, removed, setSearch } = mkDeps({
+      session: {
+        get: async (k) => {
+          if (failLoads) throw new Error("session.get 一時的失敗(持続)");
+          return { [k]: mem[k] };
+        },
+        set: async (items) => { Object.assign(mem, items); },
+      },
+    });
+    const o = createOrchestrator(deps);
+
+    // (a) 当セッション中に登録済みの DL(id=101)は、ensureLoaded() が(内部リトライも
+    //     含め)失敗しても in-memory map から postId を引けるため、fail-closed 検証まで届く。
+    await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
+    setSearch(async () => [{ id: 101, url: img("a").originalUrl, finalUrl: "https://evil.example.com/x.jpeg" } as any]);
+    await o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
+    expect(removed).toContain(101);
+
+    // (b) 失敗をキャッシュしていない → 障害が解消した後の呼び出しでは session.get が
+    //     成功し、別インスタンスが persist した(このセッションの in-memory には無い)
+    //     downloadId=102 の redirect map エントリも正しく読み込まれる。
+    failLoads = false;
+    mem["redirectMap"] = { "102": "9" };
+    setSearch(async () => [{ id: 102, url: "https://downloads.fanbox.cc/images/post/9/z.jpeg", finalUrl: "https://evil.example.com/z.jpeg" } as any]);
+    await o.handleDownloadChanged({ id: 102, state: { current: "complete", previous: "in_progress" } } as any);
+    expect(removed).toContain(102);
+  });
+
+  it("codex-review 指摘(3 巡目): session.get が数回連続で一時的に失敗しても短い遅延を挟んだリトライで復旧し、SW 再起動後に persist 済み(in-memory には無い)downloadId の fail-closed 検証を取りこぼさない", async () => {
+    const mem: Record<string, unknown> = { redirectMap: { "101": "1" } };
+    let getCalls = 0;
+    const { deps, removed, setSearch } = mkDeps({
+      session: {
+        get: async (k) => {
+          getCalls++;
+          if (getCalls <= 2) throw new Error("session.get 一時的失敗");
+          return { [k]: mem[k] };
+        },
+        set: async (items) => { Object.assign(mem, items); },
+      },
+    });
+    setSearch(async () => [{ id: 101, url: "https://downloads.fanbox.cc/images/post/1/a.jpeg", finalUrl: "https://evil.example.com/x.jpeg" } as any]);
+    const o = createOrchestrator(deps);
+    // loadRedirectMap() を呼ばず、いきなり onChanged が来た(SW 起動レース)を模倣。
+    await o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
+    expect(getCalls).toBeGreaterThanOrEqual(3);
+    expect(removed).toContain(101);
+  });
+});
+
+describe("safeReplacement(最終レビュー修正 P2: 保存済み illegalCharReplacement の実行時中和)", () => {
+  it("'/' を含む場合は '_' に置き換える", () => { expect(safeReplacement("/")).toBe("_"); });
+  it("'\\\\' を含む場合は '_' に置き換える", () => { expect(safeReplacement("\\")).toBe("_"); });
+  it("空文字は '_' に置き換える", () => { expect(safeReplacement("")).toBe("_"); });
+  it("正常な置換文字はそのまま返す", () => { expect(safeReplacement("_")).toBe("_"); expect(safeReplacement("-")).toBe("-"); });
 });
