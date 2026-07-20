@@ -14,11 +14,23 @@ async function runDownloadFor(postId: string): Promise<DownloadResponse | null> 
 }
 
 function styleBtn(b: HTMLButtonElement, small = false) {
-  Object.assign(b.style, {
-    padding: small ? "2px 8px" : "6px 12px", borderRadius: "6px", cursor: "pointer",
-    fontSize: small ? "12px" : "14px", border: "1px solid rgba(0,0,0,.2)",
-    background: "#fff", color: "#222", lineHeight: "1.4",
-  });
+  if (small) {
+    // カード上に重なる小ボタン: 明るいサムネでも暗いサムネでも視認できるよう
+    // 濃い半透明背景 + 白文字 + 影でコントラストを確保する(白背景だと明るい
+    // サムネに埋没して気づかれない ── 実 FANBOX での見落とし報告に対応)。
+    Object.assign(b.style, {
+      padding: "4px 10px", borderRadius: "6px", cursor: "pointer",
+      fontSize: "14px", fontWeight: "700", border: "1px solid rgba(255,255,255,.65)",
+      background: "rgba(0,0,0,.72)", color: "#fff", lineHeight: "1.4",
+      boxShadow: "0 1px 5px rgba(0,0,0,.5)",
+    });
+  } else {
+    Object.assign(b.style, {
+      padding: "6px 12px", borderRadius: "6px", cursor: "pointer",
+      fontSize: "14px", border: "1px solid rgba(0,0,0,.2)",
+      background: "#fff", color: "#222", lineHeight: "1.4",
+    });
+  }
 }
 function swapText(b: HTMLButtonElement, temp: string, ms = 2500) {
   const orig = b.dataset.origText ?? b.textContent ?? "";
