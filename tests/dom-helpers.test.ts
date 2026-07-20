@@ -20,6 +20,16 @@ describe("postIdFromHref", () => {
     expect(postIdFromHref("/@ropy")).toBeNull();
     expect(postIdFromHref("https://www.fanbox.cc/@ropy/plans")).toBeNull();
   });
+  it("外部ホストの /posts/{id} は null を返す(一覧ページの外部リンク誤認防止)", () => {
+    expect(postIdFromHref("https://example.com/posts/123")).toBeNull();
+    expect(postIdFromHref("https://twitter.com/posts/456")).toBeNull();
+  });
+  it("fanbox.cc サブドメイン(例: ropy.fanbox.cc)の /posts/{id} は取得できる", () => {
+    expect(postIdFromHref("https://ropy.fanbox.cc/posts/12272980")).toBe("12272980");
+  });
+  it("相対 URL /@creator/posts/{id} は従来どおり取得できる", () => {
+    expect(postIdFromHref("/@ropy/posts/12272980")).toBe("12272980");
+  });
 });
 
 describe("isCreatorPostListPage", () => {

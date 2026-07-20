@@ -4,10 +4,17 @@ export function postIdFromPathname(pathname: string): string | null {
 }
 
 // href(相対 or 絶対)から投稿 postId を抽出。投稿リンクでなければ null。
+// 絶対 URL の場合は fanbox.cc ホスト(www.fanbox.cc または *.fanbox.cc)のみ対象。
+// 相対 URL(host 無し)は従来どおり許可。
 export function postIdFromHref(href: string): string | null {
-  let path = href;
-  try { path = new URL(href, "https://www.fanbox.cc").pathname; } catch { /* 相対のまま */ }
-  return postIdFromPathname(path);
+  try {
+    const u = new URL(href, "https://www.fanbox.cc");
+    // 絶対 URL で fanbox 以外のホストは対象外(外部リンク誤認防止)
+    if (u.host !== "fanbox.cc" && !u.host.endsWith(".fanbox.cc")) return null;
+    return postIdFromPathname(u.pathname);
+  } catch {
+    return null;
+  }
 }
 
 // クリエイター投稿一覧の面か。投稿詳細は false。true になるのは:
