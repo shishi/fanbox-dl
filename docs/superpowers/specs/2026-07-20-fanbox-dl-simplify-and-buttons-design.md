@@ -52,11 +52,17 @@ dedup をやめると「二度 DL しない/中断を追跡する」ための仕
    (完了/中断の永続追跡・resume・needs_page は行わない)。`download()` 成功時に
    `downloadId → postId` を Map に記録(storage.session 同期)。`onChanged` の complete で
    その downloadId が Map にあれば `DownloadItem.finalUrl` を `validateMediaUrl(finalUrl, postId)`
-   で照合し、**allowlist 外なら `chrome.downloads.removeFile` + `erase` してユーザーに
-   明示通知**(「許可外 URL へリダイレクトされたためダウンロードを破棄しました」)。
+   で照合し、**allowlist 外なら `chrome.downloads.removeFile` + `erase` して破棄**する。
+   **通知チャネル(normative)**: この onChanged は click 応答を返した後に発火するため
+   content script の alert へは届かない(原設計 §7b の zip 失敗と同じ配達制約)。よって
+   破棄の通知は **SW の console(`console.error`)へのログ**とする(「許可外 URL へ
+   リダイレクトされた可能性があるためダウンロードを破棄しました」)。ファイル自体は
+   removeFile+erase で除去済みのため、脅威は通知の有無によらず中和される。
    **fail-closed(normative)**: complete 時に `chrome.downloads.search({id})` で完全な
    `DownloadItem` を取得し、item が得られない/`finalUrl` を確定できない場合は「検証済み」と
-   みなさず、上記と同じ破棄+通知に倒す(finalUrl が唯一のリダイレクト検出経路になったため、
+   みなさず、上記と同じ破棄+ログに倒す(**`finalUrl` が無いとき `url`(要求 URL)で代用しない**
+   ── 要求 URL は allowlist 通過済みでリダイレクト先を反映しないため。finalUrl が唯一の
+   リダイレクト検出経路になったため、
    未確認を成功扱いしない)。照合後(成功・失敗・未確認どれでも)Map から除去。zip の blob URL
    revoke 用の onChanged 分岐も併存する(既存)。この Map は dedup には一切使わない
    (照合が済めば消える揮発データ)。

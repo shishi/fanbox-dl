@@ -148,6 +148,8 @@ function fileToItem(f: RawFile): Omit<FileItem, "seq" | "total"> {
 
 (`push`/`seen`/`groups` の重複スキップ・グルーピング・embed カウントは現状のまま維持。`parseIndex` 変数は削除。)
 
+**さらに `tests/render-adapter.test.ts` を更新**: このテストは `PostData` リテラルに `updatedAtIso`、`FileItem` リテラルに `idemKey`/`stableContentId`/`refetch` を書いているため、Step 2 の型変更後に typecheck が落ちる。これらのフィールドを両リテラルから削除する(render-adapter の入出力アサーション本体 = contentId/plan/filename/seq/total 等は変更しない)。
+
 - [ ] **Step 4: `tests/parse.test.ts` を更新(identity アサーション撤去)**
 
 `stableContentId` / `idemKey` / `refetch` / `updatedAtIso` を参照する assertion を削除し、残す観点に置き換える。具体的には:
@@ -171,7 +173,10 @@ files: Array<{ url: string; size?: number }>, postId: string,
 - 本体の `buffers.set(f.idemKey, buf)` を `buffers.set(f.url, buf)` に。
 - `buildZip` 内 `const buf = buffers.get(f.idemKey);` を `const buf = buffers.get(f.url);` に(`f` は `block.files` の FileItem で `f.url` を持つ)。
 - 呼び出し側(orchestrator)は `b.files.map((f) => ({ url: f.url, size: f.size }))` を渡す(Step 6)。
-- `tests/zip.test.ts`: `collectZipSources` に渡す item と `buildZip` のフィクスチャの `idemKey` 参照を `url` ベースに更新(item は `{url, size}`、buildZip の buffers Map は `new Map([[block.files[0].url, ...]])`)。zipEligible / 事前サイズ / budget / 欠落 throw / エントリ名衝突 / redirect:"error" の各テストは維持。
+- `tests/zip.test.ts`: `collectZipSources` に渡す item と `buildZip` のフィクスチャの `idemKey` 参照を `url` ベースに更新(item は `{url, size}`、buildZip の buffers Map は `new Map([[block.files[0].url, ...]])`)。zipEligible / 事前サイズ / budget / 欠落 throw / エントリ名衝突 の各テストは維持。
+  **さらに `redirect:"error"` のアサーションを新規追加**(現状の zip.test には無い): fetchFn の
+  mock に渡された `init` を捕捉し、`collectZipSources` が `fetch(url, { credentials:"include", redirect:"error" })`
+  で呼んでいることを検証する(例: `let seenInit; fetchFn = async (_u, init) => { seenInit = init; return chunked([1]).resp; }` として `expect(seenInit.redirect).toBe("error")`)。
 
 Run: `wsl.exe -e bash -lc 'export PATH=$HOME/.npm-global/bin:$PATH; cd /home/shishi/dev/src/github.com/shishi/fanbox-dl && bun run test tests/zip.test.ts 2>&1 | tail -8'`
 Expected: zip.test.ts green。
@@ -346,11 +351,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
     // spec §変更 A / §4a-3: 完了時に finalUrl を allowlist 再検証、fail-closed。
     const [item] = await deps.downloads.search({ id: delta.id });
-    const finalUrl = (item as any)?.finalUrl || item?.url || "";
+    // fail-closed(spec §変更 A): finalUrl が無いとき url(要求 URL)で代用しない。
+    const finalUrl = (item as any)?.finalUrl as string | undefined;
     if (!item || !finalUrl || !validateMediaUrl(finalUrl, postId).ok) {
       try { await deps.downloads.removeFile(delta.id); } catch {}
       try { await deps.downloads.erase({ id: delta.id }); } catch {}
-      deps.log(`[fanbox-dl] 許可外 URL へリダイレクトされた可能性があるためダウンロードを破棄しました(postId ${postId})`);
+      deps.log(`[fanbox-dl] 許可外 URL へリダイレクトされた可能性があるためダウンロードを破棄しました(postId ${postId})`); // spec §変更 A: click 応答返却後のため console が通知チャネル(zip と同じ制約)
     }
   }
 
@@ -493,12 +499,18 @@ describe("orchestrator fire-and-forget", () => {
     await o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
     expect(removed).toContain(101); expect(erased).toContain(101);
     expect(logs.some((l) => l.includes("破棄"))).toBe(true);
-    // (b) item 取得不能(map から消えているので何もしない → 別 id で検証)
+    // (b) item 取得不能 → fail-closed
     const d2 = mkDeps(); const o2 = createOrchestrator(d2.deps);
     await o2.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
     d2.setSearch(async () => []); // item 無し
     await o2.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
     expect(d2.removed).toContain(101); // fail-closed
+    // (b2) item はあるが finalUrl が無い → fail-closed(url で代用しない)
+    const d2b = mkDeps(); const o2b = createOrchestrator(d2b.deps);
+    await o2b.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
+    d2b.setSearch(async () => [{ id: 101, url: img("a").originalUrl } as any]); // finalUrl 欠落
+    await o2b.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
+    expect(d2b.removed).toContain(101);
     // (c) 正常 finalUrl
     const d3 = mkDeps(); const o3 = createOrchestrator(d3.deps);
     await o3.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
