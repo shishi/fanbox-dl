@@ -1,5 +1,5 @@
 import { fetchPostInfo } from "../fanbox/api";
-import { postIdFromPathname, postIdFromHref, isCreatorPostListPage, selectPostAnchorIndicesToInject } from "./dom-helpers";
+import { postIdFromPathname, postIdFromHref, isCreatorPostListPage, selectPostAnchorIndicesToInject, isPostDateRowText, isPostTitleHeadingText } from "./dom-helpers";
 import type { DownloadRequestMessage, DownloadResponse } from "./messages";
 
 // 指定 postId の投稿を DL(content script が isolated world で post.info を fetch → SW へ)。
@@ -51,39 +51,39 @@ function makeDlButton(label: string, small: boolean, onClick: () => Promise<Down
   return b;
 }
 
-// --- 投稿ページ: タイトル近く(fallback 固定右下) ---
+// --- 投稿ページ: 日付ヘッダーの下(fallback 固定右下) ---
 const POST_CONTAINER_ID = "fbxdl-post-btn";
-function findTitleAnchor(): HTMLElement | null {
-  // ハッシュ化クラスに依存せず、main/article 内の最初の h1、無ければページ最初の h1。
-  const scopes = [document.querySelector("article"), document.querySelector("main"), document.body];
-  for (const scope of scopes) {
-    const h = scope?.querySelector<HTMLElement>("h1");
-    if (h && h.textContent && h.textContent.trim().length > 0) return h;
-  }
-  return null;
-}
 // 投稿ページボタンの挿入基準要素を決める。shishi 要望で「日付の下」に置く。
 // 投稿ヘッダーは <div PostHead><h1 PostTitle>…</h1><div PostHeadBottom>日付…</div></div>
 // の構造で、日付は h1 の「次の兄弟要素」。クラス名はハッシュ化される(styled__…-sc-…)
-// ため狙い撃ちできないので、構造(nextElementSibling)で日付ヘッダーを取り、その
-// afterend に置く。日付要素が無ければ h1 直後(従来位置)、h1 も無ければ null を返し
-// 呼び出し側が固定右下へフォールバックする。
-// kind は placement の昇格判定に使う("date" が最終状態、"title" は日付行が
-// 後から描画されたら date へ付け替える)。codex-review 指摘(P2): h1 直後に
-// フォールバック配置した後に日付行が非同期に現れるケースで、単一の
-// "anchored" 状態だと永久にタイトル直後のままになる。また、その時点の
-// title.nextElementSibling は注入済みボタン自身なので、探索でボタンをスキップ
-// しないと日付行を掴めない。
-type PostButtonAnchor = { el: HTMLElement; kind: "date" | "title" };
-function findPostButtonAnchor(): PostButtonAnchor | null {
-  const title = findTitleAnchor();
-  if (!title || !title.parentElement) return null;
-  let next = title.nextElementSibling;
-  while (next && next.id === POST_CONTAINER_ID) next = next.nextElementSibling; // 自ボタンは日付候補から除外
-  if (next instanceof HTMLElement && next.parentElement === title.parentElement) {
-    return { el: next, kind: "date" };
+// ため狙い撃ちできない。
+//
+// E2E 退行の root cause: 投稿ページには投稿タイトル以外の h1(クリエイター
+// ヘッダーのクリエイター名。実測でログアウト表示ですら h1 が 3 つあり、
+// クリエイター名 h1 が文書順で先)が存在するため、「最初の h1 = 投稿タイトル」
+// という仮定ではクリエイターヘッダーへ誤アンカーする(実 E2E でボタンが
+// CreatorHeader__Column 内に刺さり 0×0 に潰れて不可視になった)。
+// そこで h1 を文書順に全走査し、次の 2 条件を両方満たす最初の h1 の日付行を
+// 採用する(どちらか単独では codex-review で反例が出た二重ガード):
+//  (1) h1 テキストが document.title の先頭に一致(isPostTitleHeadingText:
+//      投稿タイトル h1 の構造的特定。クリエイター名 h1・本文 h1 を排除)
+//  (2) 次の兄弟(自ボタンはスキップ)が日付行らしいテキスト(isPostDateRowText:
+//      先頭 40 文字以内で年 20XX →時刻 H:MM の順、ロケール耐性)
+// 見つからない間(描画途中・変種レイアウト)は null を返し、呼び出し側の
+// 固定右下フォールバックに任せる。codex-review 指摘(round1 P2): 「最後の h1」
+// 等の h1 ベース暫定アンカーは、本文中のユーザー作成 h1(記事型投稿の見出し
+// ブロック)へ誤アンカーし得るため持たない。誤った場所に刺さるより、確実に
+// 見える固定位置で日付行の出現を待つ方が安全(ステートレス再アンカーにより
+// 出現後 1 秒以内に正位置へ自己修復する)。
+function findPostButtonAnchor(): HTMLElement | null {
+  for (const h of Array.from(document.querySelectorAll<HTMLElement>("h1"))) {
+    if (!h.parentElement) continue;
+    if (!isPostTitleHeadingText(h.textContent ?? "", document.title)) continue;
+    let next = h.nextElementSibling;
+    while (next && next.id === POST_CONTAINER_ID) next = next.nextElementSibling; // 自ボタンは日付候補から除外
+    if (next instanceof HTMLElement && isPostDateRowText(next.textContent ?? "")) return next;
   }
-  return { el: title, kind: "title" };
+  return null;
 }
 // 「アンカー基準の正規位置」に置いた状態のスタイル(日付ヘッダーの直下に、独立した
 // 行として少し間隔を空けて表示)。fallback から復帰するときも同じ値へ揃える。
@@ -101,16 +101,16 @@ function styleAnchoredPostButton(b: HTMLElement) {
 function placePostButton() {
   const existing = document.getElementById(POST_CONTAINER_ID);
   const anchor = findPostButtonAnchor();
-  // 最終レビュー修正 P3(round5 codex-review 指摘)+ 今回 codex-review P2:
-  // placement は "date" | "title" | "fallback" の三値。"date"(日付ヘッダー直後)
-  // だけが最終状態で、それ以外は「より良いアンカーが現れたら付け替える」暫定状態。
-  // - "fallback"(固定右下): アンカーが見つかり次第そちらへ移動
-  // - "title"(h1 直後): 日付行が後から描画されたら date へ昇格
-  // 単純な「ボタンが有れば return」や単一の "anchored" 状態だと、非同期描画で
-  // アンカーが後から現れたとき永久に暫定位置へ固定されてしまう。
+  // 最終レビュー修正 P3(round5)+ codex-review P2 + E2E 退行対応:
+  // 「一度置いたら終わり」の終端状態を持たない。毎回「今の DOM での最良
+  // アンカー」を再計算し、ボタンがその直後に居なければ移動する。
+  // 終端状態(旧 "anchored" / "date")方式は、描画途中の誤アンカー
+  // (クリエイター名 h1 への誤配置など)が確定してしまい自己修復できない
+  // ことが実 E2E で判明したため廃止した。再計算は決定的(同じ DOM なら同じ
+  // 結果)なので、正しく置けていれば下の直後判定で即 return する=冪等。
+  // アンカーが見つからない間は現位置(fallback 含む)を維持する。
   if (existing) {
-    const placement = existing.dataset.fbxdlPlacement;
-    if (placement === "date" || !anchor || placement === anchor.kind) return;
+    if (!anchor || existing.previousElementSibling === anchor) return;
     // codex-review 指摘(round5 P2): ここで既存ボタンを remove() して新規に
     // 作り直すと、ユーザーが既にクリック済みで runDownloadFor() が in-flight
     // (b.disabled = true 済み、テキストも変更済み)の場合にその状態が失われ、
@@ -119,8 +119,8 @@ function placePostButton() {
     // そのため作り直さず、既存の DOM ノードをそのまま(disabled 状態や
     // イベントリスナーを保ったまま)本来の位置へ移動するだけにする。
     styleAnchoredPostButton(existing);
-    anchor.el.insertAdjacentElement("afterend", existing);
-    existing.dataset.fbxdlPlacement = anchor.kind;
+    anchor.insertAdjacentElement("afterend", existing);
+    existing.dataset.fbxdlPlacement = "date";
     return;
   }
   const btn = makeDlButton("⬇ fanbox-dl", false, () => {
@@ -130,8 +130,8 @@ function placePostButton() {
   btn.id = POST_CONTAINER_ID;
   if (anchor) {
     styleAnchoredPostButton(btn);
-    anchor.el.insertAdjacentElement("afterend", btn);
-    btn.dataset.fbxdlPlacement = anchor.kind;
+    anchor.insertAdjacentElement("afterend", btn);
+    btn.dataset.fbxdlPlacement = "date";
   } else {
     // フォールバック: 固定右下(必ず出る)
     Object.assign(btn.style, { position: "fixed", right: "16px", bottom: "16px", zIndex: "99999" });
@@ -253,18 +253,13 @@ function watch() {
     // 独立に、毎周期「投稿ページなのにボタンが無い」かを確認して復活させる
     // (placePostButton は #fbxdl-post-btn 存在ガードで冪等 = 二重注入しない)。
     //
-    // codex-review 指摘(round5 P3): ここで「ボタンが存在するか」だけを見て
-    // 判定すると、暫定配置(固定右下 fallback / h1 直後 title)になった場合、
-    // 以後 #fbxdl-post-btn は存在し続けるためこの分岐が二度と実行されず、
-    // placePostButton() 内の「アンカー復元後の付け替え」「日付行出現時の
-    // date への昇格」(今回 codex-review P2)が呼ばれる機会自体が失われる。
-    // 最終状態 "date" 以外は毎周期 placePostButton() を呼び続け、より良い
-    // アンカーが現れ次第そちら側で付け替えられるようにする(placePostButton
-    // は現在の最良アンカーに配置済みなら何もしない=冪等)。
-    if (postIdFromPathname(location.pathname) !== null) {
-      const btn = document.getElementById(POST_CONTAINER_ID);
-      if (!btn || btn.dataset.fbxdlPlacement !== "date") placePostButton();
-    }
+    // codex-review 指摘(round5 P3)+ E2E 退行対応: 投稿ページでは毎周期
+    // placePostButton() を呼ぶ。ボタンの有無や placement で呼び出しを間引くと、
+    // 誤アンカー・subtree 再描画による消失・アンカーの遅延出現をどれも拾えない
+    // ケースが生じる(終端状態バグの温床)。冪等ガード(最良アンカーの直後に
+    // 配置済みなら即 return)は placePostButton 側にあるため、毎周期呼んでも
+    // コストは h1 走査 1 回分で済む。
+    if (postIdFromPathname(location.pathname) !== null) placePostButton();
   };
   window.addEventListener("popstate", check);
   setInterval(check, 1000);

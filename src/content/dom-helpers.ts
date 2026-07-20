@@ -27,6 +27,61 @@ export function isCreatorPostListPage(pathname: string, host: string): boolean {
   return isCreatorSubdomain && /^\/(?:posts\/?)?$/.test(pathname);
 }
 
+// 投稿ヘッダーの「日付行」らしいテキストか。
+// E2E 退行の root cause 対応: 投稿ページには投稿タイトル以外の h1(クリエイター
+// ヘッダーのクリエイター名)が存在し、文書順で投稿タイトルより前に来る。
+// 「最初の h1 = 投稿タイトル」という仮定は誤アンカーを生むため、h1 の隣の
+// テキストが日付行かどうかで投稿ヘッダーを判別する。クラス名はハッシュ化される
+// ので使えず、日付の表記はロケール依存("July 19th, 2026 12:00・All users" /
+// "2026年7月19日 12:00・全体公開")のため、ロケールに依らない時刻パターン
+// FANBOX の日付行の構造を条件にする: 日付は行の「先頭」にあり、年(20XX)→
+// 時刻(H:MM)の順で現れる("July 19th, 2026 12:00・All users" /
+// "2026年7月19日 12:00・全体公開")。可視性ラベルやプラン名は日付の後ろに付く
+// 可変サフィックスなので判定に使わない。具体的には「先頭 40 文字以内に
+// もっともらしい年(20XX)が時刻より前に出現する」ことを条件にする。
+// codex-review 指摘の変遷:
+// - 時刻のみ → 本文 "Starts 12:00 JST" に誤爆(round1 P2)
+// - 任意の 4 桁を年扱い → 値段 "1000円プランは 12:00 開始" に誤爆(round2 P2)
+// - 全長 80 文字上限 → 長いプラン名つきの本物のヘッダーを弾く(round2 P3)
+// 先頭 40 文字だけを見ることで、サフィックスの長さに依存せず(P3 解消)、
+// 20XX 限定で値段・ID の誤検出を避け(P2 解消)、年→時刻の順序制約で本文の
+// 偶然の併記も除外する。なお呼び出し側(findPostButtonAnchor)は文書順の
+// 先勝ちで選ぶため、本物のヘッダー(本文より前)が確実にマッチする限り、
+// 本文側に万一の偽陽性が残っても勝つことはない。
+export function isPostDateRowText(text: string): boolean {
+  const head = text.trim().slice(0, 40);
+  const yearIndex = head.search(/20\d{2}/);
+  const time = /\d{1,2}:\d{2}/.exec(head);
+  return yearIndex >= 0 && time !== null && yearIndex < time.index;
+}
+
+// h1 のテキストが「この投稿ページの投稿タイトル」かを document.title との
+// 前方一致で判定する。投稿ページの document.title は
+// 「<投稿タイトル>｜<クリエイター名>｜pixivFANBOX」形式(実測)のため、
+// 先頭一致するのは投稿タイトル h1 だけで、クリエイター名 h1(文書順で先に
+// 現れる)は途中一致にしかならない。
+// codex-review 指摘(round3 P2): 日付行判別(isPostDateRowText)単体では、
+// クリエイターヘッダー h1 の隣に年+時刻を含むテキスト(プロフィールの配信
+// スケジュール等)が来た場合に誤爆する。テキストヒューリスティックをいくら
+// 精緻化しても「どの h1 が投稿タイトルか」は決まらないため、この構造ガードを
+// AND 条件で重ねる。SPA 遷移直後で document.title が未更新の間は不一致に
+// なり得るが、その間は固定右下フォールバックに置かれ、タイトル更新後の
+// 再計算(毎秒)で正位置へ自己修復する。
+// codex-review 指摘(round4 P2): 単純な前方一致だと、投稿タイトルがクリエイター
+// 名で始まる場合("POPYPOPY 夏コミ進捗…")にクリエイター名 h1 も通ってしまう。
+// 一致直後が区切り(全角「｜」実測。round5 P2 対応で ASCII「|」・空白付きも許容)
+// であることを要求し、第 1 セグメント(=投稿タイトル)全体との一致にする。
+// 投稿タイトル自体に「｜」が含まれていても、h1 はタイトル全文を持つため区切り
+// 位置はずれない。万一 FANBOX が別形式のタイトルを使う環境ではここが false に
+// なり続けるが、その場合ボタンは可視の固定右下フォールバックに留まる
+// (graceful degradation。不可視・誤配置にはならない)。
+export function isPostTitleHeadingText(h1Text: string, docTitle: string): boolean {
+  const t = h1Text.trim();
+  if (t.length === 0 || !docTitle.startsWith(t)) return false;
+  const rest = docTitle.slice(t.length).trimStart();
+  return rest.startsWith("｜") || rest.startsWith("|");
+}
+
 // 最終レビュー3巡目 P3: 投稿一覧の 1 カードにサムネ・タイトルなど複数の
 // `/posts/{id}` anchor が存在すると、anchor 単位でボタンを付けた場合に
 // 同じ投稿へ複数ボタンが重複表示される。postId 単位で dedup する。

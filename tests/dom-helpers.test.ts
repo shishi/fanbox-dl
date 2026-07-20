@@ -1,5 +1,70 @@
 import { describe, it, expect } from "vitest";
-import { postIdFromPathname, postIdFromHref, isCreatorPostListPage, selectPostAnchorIndicesToInject } from "../src/content/dom-helpers";
+import { postIdFromPathname, postIdFromHref, isCreatorPostListPage, selectPostAnchorIndicesToInject, isPostDateRowText, isPostTitleHeadingText } from "../src/content/dom-helpers";
+
+describe("isPostTitleHeadingText(codex-review round3 P2: 日付行判別だけではクリエイターヘッダー h1 の隣の年+時刻テキストに誤爆し得るため、document.title の前方一致で投稿タイトル h1 を構造的に特定する)", () => {
+  const docTitle = "メイちゃんのえちち動画(short_ver)｜POPYPOPY｜pixivFANBOX";
+  it("投稿タイトル h1(document.title の先頭に一致)は true", () => {
+    expect(isPostTitleHeadingText("メイちゃんのえちち動画(short_ver)", docTitle)).toBe(true);
+  });
+  it("クリエイター名 h1(document.title の途中に出現)は false", () => {
+    expect(isPostTitleHeadingText("POPYPOPY", docTitle)).toBe(false);
+  });
+  it("空テキストは false(空文字は任意の文字列の prefix になるため明示的に弾く)", () => {
+    expect(isPostTitleHeadingText("", docTitle)).toBe(false);
+    expect(isPostTitleHeadingText("   ", docTitle)).toBe(false);
+  });
+  it("前後の空白は無視して比較する", () => {
+    expect(isPostTitleHeadingText("  メイちゃんのえちち動画(short_ver)  ", docTitle)).toBe(true);
+  });
+  it("投稿タイトルがクリエイター名で始まる場合、クリエイター名 h1 は false(codex-review round4 P2: 単純 prefix だと通ってしまう)", () => {
+    const t = "POPYPOPY 夏コミ進捗まとめ｜POPYPOPY｜pixivFANBOX";
+    expect(isPostTitleHeadingText("POPYPOPY", t)).toBe(false);
+    expect(isPostTitleHeadingText("POPYPOPY 夏コミ進捗まとめ", t)).toBe(true);
+  });
+  it("投稿タイトル自体に区切り文字 ｜ が含まれていても全文一致なら true", () => {
+    const t = "前編｜後編セット｜POPYPOPY｜pixivFANBOX";
+    expect(isPostTitleHeadingText("前編｜後編セット", t)).toBe(true);
+  });
+  it("ASCII パイプや空白付き区切りでも動く(codex-review round5 P2: 区切りのハードコード回避)", () => {
+    expect(isPostTitleHeadingText("タイトル", "タイトル | POPYPOPY | pixivFANBOX")).toBe(true);
+    expect(isPostTitleHeadingText("タイトル", "タイトル|POPYPOPY|pixivFANBOX")).toBe(true);
+  });
+});
+
+describe("isPostDateRowText(投稿ヘッダーの日付行の判別。E2E 退行の root cause: 最初の h1 を投稿タイトルとみなすとクリエイター名 h1 を誤って掴む)", () => {
+  it("英語ロケールの日付行(実測値)は true", () => {
+    expect(isPostDateRowText("July 19th, 2026 12:00・All users")).toBe(true);
+  });
+  it("日本語ロケールの日付行は true", () => {
+    expect(isPostDateRowText("2026年7月19日 12:00・全体公開")).toBe(true);
+  });
+  it("クリエイターヘッダー h1 の隣に来るテキスト(実測値)は false", () => {
+    expect(isPostDateRowText("")).toBe(false); // SNS アイコン列(テキスト無し)
+    expect(isPostDateRowText("3D")).toBe(false); // カテゴリ
+  });
+  it("時刻を含んでいても長文(本文など)は false", () => {
+    expect(isPostDateRowText("今日は 12:00 に起きて" + "長い本文".repeat(20))).toBe(false);
+  });
+  it("時刻パターンを含まない短文は false", () => {
+    expect(isPostDateRowText("POPYPOPY")).toBe(false);
+  });
+  it("時刻はあるが年が無い本文短文は false(codex-review P2: 本文見出し直後の誤爆防止)", () => {
+    expect(isPostDateRowText("Starts 12:00 JST")).toBe(false);
+    expect(isPostDateRowText("12:00 から配信します")).toBe(false);
+  });
+  it("年はあるが時刻が無い短文は false", () => {
+    expect(isPostDateRowText("2026 年もよろしく")).toBe(false);
+  });
+  it("値段など 20XX でない 4 桁数字は年とみなさない(codex-review round2 P2)", () => {
+    expect(isPostDateRowText("1000円プランは 12:00 開始")).toBe(false);
+  });
+  it("長いプラン名サフィックスつきの本物の日付行は true(codex-review round2 P3: 長さ上限で本物を弾かない)", () => {
+    expect(isPostDateRowText("July 19th, 2026 12:00・" + "とっても長いクリエイター定義のサポータープラン名".repeat(4))).toBe(true);
+  });
+  it("時刻が年より先に来るテキストは false(日付行は年→時刻の順)", () => {
+    expect(isPostDateRowText("12:00 開始、2026年になりました")).toBe(false);
+  });
+});
 
 describe("postIdFromPathname", () => {
   it("サブドメイン形式 /posts/{id}", () => { expect(postIdFromPathname("/posts/12272980")).toBe("12272980"); });

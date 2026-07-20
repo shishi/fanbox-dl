@@ -40,3 +40,6 @@ chg Task 3: complete (commit 944f509, options/README, build 4-entry, grep 0)
 ## E2E フィードバック修正ラウンド (2026-07-20)
 - 一覧カードボタン「非表示」報告: 実測(getBoundingClientRect/elementFromPoint)で注入・配置・最前面とも正常と確認。真因は白背景小ボタンの視認性(サムネに埋没)。濃色半透明+白文字+影へ変更 (aefd4bb)
 - 投稿ページボタンを日付ヘッダー下へ移動。placement を date/title/fallback 三値化し増分レンダリングでの昇格に対応 (codex-review P2 → clean, aaf0103)
+
+## 投稿ページボタン誤アンカー修正の残件 (2026-07-20, codex round6 で膠着打ち切り)
+- isPostTitleHeadingText はタイトルに ｜/| を含む投稿で、前半と完全一致する別 h1 + その隣が日付行様、という三重偶然時に誤アンカーし得る (P2 triaged)。click は location.pathname から postId を読むため DL 機能は配置に依存せず常に正しい。影響は cosmetic のみ、fail 方向は可視 fallback。テキストヒューリスティックへの構築的反例は尽きないため round6 で打ち切り。
