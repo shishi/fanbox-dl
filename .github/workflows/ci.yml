@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342  # v31.11.0
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7.0.2
+        with:
+          primary-key: nix-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-
+          gc-max-store-size-linux: 4G
+
+      - name: Build devShell dependencies
+        run: nix build .#devShells.x86_64-linux.default.inputDerivation --no-link
+
+      - name: Cache node_modules
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: node_modules
+          key: node-${{ hashFiles('bun.lock') }}
+
+      - name: Install
+        run: nix develop -c bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: nix develop -c bunx tsc --noEmit
+
+      - name: Test
+        run: nix develop -c bunx vitest run
+
+      - name: Build
+        run: nix develop -c bun scripts/build.mjs
+
+      - name: Verify dist artifacts
+        run: |
+          for f in \
+            dist/manifest.json \
+            dist/background/service-worker.js \
+            dist/content/content-script.js \
+            dist/offscreen/offscreen.js \
+            dist/offscreen/offscreen.html \
+            dist/options/options.js \
+            dist/options/options.html \
+          ; do
+            test -f "$f" || { echo "missing: $f"; exit 1; }
+          done
