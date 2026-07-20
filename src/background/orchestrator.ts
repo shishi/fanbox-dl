@@ -40,8 +40,16 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   // downloadId -> postId(リダイレクト再検証用の揮発データ。dedup には使わない)
   const redirect = new Map<number, string>();
 
-  async function persistRedirect(): Promise<void> {
-    await deps.session.set({ [REDIRECT_MAP_KEY]: Object.fromEntries(redirect) });
+  // 並行呼び出しでも session.set が last-write-wins で古いスナップショットに
+  // よって新しいエントリを消してしまわないよう、書き込みを単一チェーンで直列化する。
+  // スナップショット(Object.fromEntries(redirect))はチェーン内のタスクが実際に実行
+  // される時点で評価する(呼び出し時点ではない)ため、直前までの全書き込みが完了した
+  // 後の最新状態を、かつ最後に実行される set が確実に書き込む。
+  let writeChain: Promise<unknown> = Promise.resolve();
+  function persistRedirect(): Promise<void> {
+    const next = () => deps.session.set({ [REDIRECT_MAP_KEY]: Object.fromEntries(redirect) });
+    writeChain = writeChain.then(next, next);
+    return writeChain as Promise<void>;
   }
   async function loadRedirectMap(): Promise<void> {
     const r = await deps.session.get(REDIRECT_MAP_KEY);

@@ -23,13 +23,23 @@ describe("postIdFromHref", () => {
 });
 
 describe("isCreatorPostListPage", () => {
-  it("クリエイターページ(投稿一覧)は true", () => {
-    expect(isCreatorPostListPage("/@ropy")).toBe(true);
-    expect(isCreatorPostListPage("/@ropy/posts")).toBe(true);
+  it("www 形式(投稿一覧)は true", () => {
+    expect(isCreatorPostListPage("/@ropy", "www.fanbox.cc")).toBe(true);
+    expect(isCreatorPostListPage("/@ropy/posts", "www.fanbox.cc")).toBe(true);
   });
-  it("投稿詳細・その他は false", () => {
-    expect(isCreatorPostListPage("/@ropy/posts/12272980")).toBe(false);
-    expect(isCreatorPostListPage("/")).toBe(false);
-    expect(isCreatorPostListPage("/@ropy/plans")).toBe(false);
+  it("クリエイターサブドメインの / または /posts(/) は true", () => {
+    expect(isCreatorPostListPage("/", "ropy.fanbox.cc")).toBe(true);
+    expect(isCreatorPostListPage("/posts", "ropy.fanbox.cc")).toBe(true);
+    expect(isCreatorPostListPage("/posts/", "ropy.fanbox.cc")).toBe(true);
+  });
+  it("www のホーム(/)は false", () => {
+    expect(isCreatorPostListPage("/", "www.fanbox.cc")).toBe(false);
+  });
+  it("投稿詳細はホストによらず false", () => {
+    expect(isCreatorPostListPage("/@ropy/posts/12272980", "www.fanbox.cc")).toBe(false);
+    expect(isCreatorPostListPage("/posts/12272980", "ropy.fanbox.cc")).toBe(false);
+  });
+  it("その他のパスは false", () => {
+    expect(isCreatorPostListPage("/@ropy/plans", "www.fanbox.cc")).toBe(false);
   });
 });

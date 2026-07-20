@@ -93,7 +93,7 @@ let lastPath = "";
 function sync() {
   const path = location.pathname;
   const onPost = postIdFromPathname(path) !== null;
-  const onList = isCreatorPostListPage(path);
+  const onList = isCreatorPostListPage(path, location.host);
   // 投稿ページ用ボタンは詳細ページ以外では消す
   if (!onPost) document.getElementById(POST_CONTAINER_ID)?.remove();
   if (onPost) whenReady(() => placePostButton(postIdFromPathname(path)!));
@@ -104,7 +104,7 @@ function watch() {
   window.addEventListener("popstate", check);
   setInterval(check, 1000);
   // 一覧の無限スクロール等でカードが増えるのを拾う(現在が一覧のときのみ注入)
-  new MutationObserver(() => { if (isCreatorPostListPage(location.pathname)) injectListButtons(); })
+  new MutationObserver(() => { if (isCreatorPostListPage(location.pathname, location.host)) injectListButtons(); })
     .observe(document.body, { childList: true, subtree: true });
   check();
 }

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { createOrchestrator, type OrchestratorDeps } from "../src/background/orchestrator";
 import { DEFAULT_SETTINGS } from "../src/core/settings";
 
-const img = (id: string) => ({ id, extension: "jpeg", width: 1, height: 1, originalUrl: `https://downloads.fanbox.cc/images/post/1/${id}.jpeg`, thumbnailUrl: `https://downloads.fanbox.cc/images/post/1/t${id}.jpeg` });
+const img = (id: string, postId = "1") => ({ id, extension: "jpeg", width: 1, height: 1, originalUrl: `https://downloads.fanbox.cc/images/post/${postId}/${id}.jpeg`, thumbnailUrl: `https://downloads.fanbox.cc/images/post/${postId}/t${id}.jpeg` });
 const postJson = (images: any[], over: any = {}) => ({ body: { post: { id: "1", title: "T", feeRequired: 0, publishedDatetime: "2026-07-01T00:00:00+09:00", isRestricted: false, user: { userId: "9", name: "C" }, creatorId: "s", type: "image", body: { text: "", images }, ...over } } });
 
 function mkDeps(over: Partial<OrchestratorDeps> = {}) {
@@ -25,7 +25,7 @@ function mkDeps(over: Partial<OrchestratorDeps> = {}) {
     log: (m) => logs.push(m),
     ...over,
   };
-  return { deps, downloaded, erased, removed, logs, setSearch: (f: typeof searchImpl) => { searchImpl = f; } };
+  return { deps, downloaded, erased, removed, logs, mem, setSearch: (f: typeof searchImpl) => { searchImpl = f; } };
 }
 
 describe("orchestrator fire-and-forget", () => {
@@ -114,5 +114,29 @@ describe("orchestrator fire-and-forget", () => {
     // interrupted は再検証せず単に map から除去される
     setSearch(async () => { throw new Error("should not be called"); });
     await expect(o.handleDownloadChanged({ id: 101, state: { current: "interrupted", previous: "in_progress" } } as any)).resolves.toBeUndefined();
+  });
+
+  it("並行 DL: 2 件がほぼ同時に開始しても session 保存の redirect map から片方が消えない(persist レース回避)", async () => {
+    const mem: Record<string, unknown> = {};
+    let calls = 0;
+    const { deps } = mkDeps({
+      session: {
+        get: async (k) => ({ [k]: mem[k] }),
+        set: async (items) => {
+          const callIndex = calls++;
+          // 最初の呼び出しほど長く待たせ、素朴な実装なら後発の書き込みが
+          // 先に完了 → 古いスナップショットで上書き、というレースを誘発する。
+          await new Promise((r) => setTimeout(r, callIndex === 0 ? 20 : 0));
+          Object.assign(mem, items);
+        },
+      },
+    });
+    const o = createOrchestrator(deps);
+    await Promise.all([
+      o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a", "1")]) }),
+      o.handleDownloadRequest({ kind: "download", postId: "2", json: postJson([img("b", "2")], { id: "2" }) }),
+    ]);
+    const saved = (mem["redirectMap"] ?? {}) as Record<string, string>;
+    expect(Object.values(saved).sort()).toEqual(["1", "2"]);
   });
 });
