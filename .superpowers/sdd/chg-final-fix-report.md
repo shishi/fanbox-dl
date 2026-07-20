@@ -96,3 +96,79 @@ whole-branch 最終レビュー(codex native)が検出した 2 件を TDD で修
 7. codex-review 指摘(3巡目): session.get が数回連続で一時的に失敗してもリトライで復旧し、persist 済み downloadId の検証を取りこぼさない
 
 計 7 テスト追加(tests/orchestrator.test.ts: 8 → 15、リポジトリ全体: 120 → 127)。
+
+## 最終レビュー第3巡: P1/P2/P3 修正(TDD)
+
+対象コミット: 4db5d77
+core 無改造: `git diff --stat f67156f..HEAD -- src/core/{template-engine,sanitizer,path-validator,base64}.ts` は空(確認済み)。
+
+### 修正内容
+
+- **P1(src/background/orchestrator.ts handleDownloadChanged)**: complete 時、
+  finalUrl allowlist 検証を redirect map からの削除・persist より必ず先に
+  完了させるよう順序を反転。persist(session.set)が失敗しても fail-closed
+  検証(removeFile/erase)は既に完了済みになる。interrupted は従来どおり
+  検証不要で delete+persist のみ。
+
+- **P2(src/background/orchestrator.ts startDownload)**: persistRedirect が
+  失敗したら download を cancel+removeFile+erase して fail-closed にし、
+  追跡不能な DL を残さない。OrchestratorDeps.downloads に `cancel(id)` を
+  追加し service-worker.ts で `chrome.downloads.cancel` を束縛。
+
+- **P3(src/content/content-script.ts injectListButtons)**: 投稿一覧の 1
+  カードに複数の /posts/{id} anchor がある場合のボタン重複を postId 単位で
+  dedup。
+
+### codex-review(native, `--uncommitted`)を 6 巡実施、5 件の追加欠陥を fix→re-review で解消
+
+1. **cancel/removeFile 両方必要**: 高速 DL は persist 失敗検知前に complete
+   し得るため cancel だけでは足りない。removeFile も呼ぶよう追加。
+2. **cancel 後の再開可能パーティションファイル懸念**: chrome.downloads 公式
+   リファレンスで cancel()/removeFile()/canResume の仕様を確認し、
+   USER_CANCELED は resume 前提のネットワーク中断と異なり再開可能ファイルを
+   残さないことを検証・コメントに明記(→ 追加修正不要と判断)。
+3. **persist 失敗クリーンアップが「既に検証完了/進行中」の正当な DL を横取り
+   して壊すレース**: handleDownloadChanged が「この downloadId の結末を
+   引き受ける」と決めた瞬間(検証開始前、await を挟まず同期的)に redirect
+   map から削除するよう変更。startDownload 側は `redirect.has(id)` が false
+   なら手を出さない。JS の同期実行区間は中断されないためレースが原理的に
+   閉じる。テストで実際に修正前は RED になることを確認済み。
+4. **dedup マーカーの anchor 依存が DOM 部分再レンダリングで破綻**: 選んだ 1
+   anchor だけにマークすると重複再発、全 anchor にマークすると逆にボタン
+   消失が永続化。根本原因(マーカーと実体が別ノード)を解消するため、
+   「既にボタンがあるか」をボタン自身の生存(data-fbxdl-for)から判定する
+   設計に変更(indicesToMarkAsInjected は不要になり削除)。
+5. **実 fanbox DOM を検証した上での指摘: 最初の occurrence を選ぶと共有
+   コンテナ側の外側 wrapper anchor を選んでしまい、ボタンが個々のカードでは
+   なく共有コンテナに積み上がる**: 実際に headless Chrome で
+   `https://www.fanbox.cc/@ropy/posts` の DOM を取得し、1 投稿につき外側
+   CardPostItem__Wrapper(親 = 共有コンテナ)と内側 PostCover__StyledLink
+   (親 = 個々のカード)が入れ子になっていることを確認した上での指摘。
+   祖先 anchor は子孫より必ず先に querySelectorAll に現れる不変則を利用し、
+   同一 postId 内では「文書順で最後」を選ぶよう変更(常により深くネストされた
+   側を選ぶ)。
+
+### 6巡目で codex から出た 2 件は対応せず、懸念として記録
+
+- **[orchestrator.ts] interrupted が persist 失敗より先に届くと fail-closed
+  cleanup が完全にスキップされる**: 検証したところ、これは今回の変更が
+  作った回帰ではなく、変更前から存在した仕様どおりの挙動(interrupted は
+  「検証不要、delete+persist のみ」と元コードから明記されている)。今回の
+  P2 修正は「persist 失敗時に他の誰も処理していなければ fail-closed で
+  片付ける」安全網であり、interrupted 側が既に(仕様どおり)結末を確定させて
+  いる場合にまで手を広げる話ではないため、対応しなかった。
+- **[content-script.ts] 同一 postId が正当に複数カード(pin 留め + 通常
+  フィード等)で表示される場合、dedup により片方にしかボタンが付かない**:
+  ユーザー指示書に明記された「postId 単位で dedup」という設計そのものへの
+  疑義であり、fanbox の実ページでこの表示パターンが実在するかは未検証
+  (5 件目のような実 DOM 確認は行っていない、codex の推測ベースの指摘)。
+  指示された設計を逸脱してまで対応する根拠が無いため、既知のトレードオフ
+  として記録するにとどめた。
+
+### 完了確認
+
+- `bun run test`: 137 tests, 12 files, all green
+- `bun run typecheck`: エラー 0
+- `bun run build`: 成功(content-script.js 7.6kb / service-worker.js 47.9kb
+  / options.js 12.0kb / offscreen.js 1.5kb)
+- core 4 ファイル差分: 空
