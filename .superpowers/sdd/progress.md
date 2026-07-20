@@ -36,3 +36,7 @@ chg Task 3: complete (commit 944f509, options/README, build 4-entry, grep 0)
   - redirect-map: terminal interrupted(SERVER_FORBIDDEN/disk-full/cancel)で mapping が browser 終了まで残存 + 失敗が silent(fire-and-forget の性質上、通常 DL の完了/失敗は追跡しない設計。finalUrl 検証は complete のみ)
   - 一覧ボタン: FANBOX が card host を非投稿へ再利用/anchor 一時差し替えした場合、古い data-fbxdl-for ボタンが残り得る(実 DOM での再利用挙動は未検証。手動ゲートで確認)
   現状 HEAD 0ce31f6: 142 tests green / typecheck 0 / build 4-entry / core 無変更
+
+## E2E フィードバック修正ラウンド (2026-07-20)
+- 一覧カードボタン「非表示」報告: 実測(getBoundingClientRect/elementFromPoint)で注入・配置・最前面とも正常と確認。真因は白背景小ボタンの視認性(サムネに埋没)。濃色半透明+白文字+影へ変更 (aefd4bb)
+- 投稿ページボタンを日付ヘッダー下へ移動。placement を date/title/fallback 三値化し増分レンダリングでの昇格に対応 (codex-review P2 → clean, aaf0103)
