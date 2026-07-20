@@ -121,11 +121,51 @@ function whenReady(cb: () => void, timeoutMs = 6000) {
 // host 差し替え・カード全体の再レンダリングいずれの理由であれ)消えれば、
 // 次回呼び出しで自動的に「無い」ことになり、判定がボタンの実在と常に一致する
 // (呼び出しをまたぐ独立した状態を持たない)。
+//
+// 最終レビュー6巡目 P2: FANBOX が SPA/無限スクロールでカードの host ノード
+// (anchor の親要素)自体を使い回し、anchor の href だけを別の投稿へ差し替える
+// ケースがある。この場合、host には旧 postId 束縛のボタンがまだ実在するため
+// 上記の「ボタンの実在で判定」だけでは「既にある」と誤判定してしまい、旧
+// postId を握ったボタンが除去されないまま残ってしまう(このカードを押すと
+// 別の投稿がダウンロードされる)。
+// そこで注入走査のたびに、各 anchor の現在の host を見て「host 内の既存
+// ボタンの束縛 postId(data-fbxdl-for)」と「anchor の現在の href から得た
+// postId」を比較し、食い違っていれば stale と判断してその場で除去する
+// (alreadyInjectedPostIds の集計より前に行うことで、除去した分は自動的に
+// 「無い」side に回り、直後の走査で新 postId のボタンとして再注入される)。
+// codex-review 指摘(最終レビュー6巡目・native): ボタンは常に
+// host.appendChild(btn) で host の「直接の子」として追加される(下の注入
+// ループ参照)。通常の querySelector は host 配下の subtree 全体を深く探索
+// するため、入れ子 anchor 構造(共有コンテナ側の外側 anchor の host が、
+// 個々のカード側の内側 anchor の host を子孫として含むケース。上の
+// codex-review 指摘(累積)コメント参照)でこれを使うと、外側 anchor の走査
+// 時に無関係な別カード(内側 anchor)のボタンまで拾って「stale」と誤判定し
+// 除去してしまう。":scope >" で host の直接の子だけに限定し、この host 自身
+// が実際に保持しているボタンだけを見る。
+// 不変条件: ボタンの click ハンドラが握る postId は、常にそのボタンが実在
+// する host に対応する anchor の「現在の」href の postId と一致する
+// (host 再利用で anchor href だけが差し替わっても、古い postId を握った
+// ボタンが生き残ることはない)。
 const INJECTED_BUTTON_SELECTOR = "[data-fbxdl-for]";
 function injectListButtons() {
   const selector = 'a[href*="/posts/"]';
   const anchors: HTMLAnchorElement[] = Array.from(document.querySelectorAll(selector));
   const postIds = anchors.map((a) => postIdFromHref(a.getAttribute("href") || ""));
+
+  // stale 検出: host が再利用され anchor の href(postId)だけが差し替わった
+  // 場合、host に残る既存ボタンは古い postId を束縛したままになる。現在の
+  // postId と食い違うボタンはここで除去し、以後の「既にある」判定
+  // (alreadyInjectedPostIds)から外す。
+  for (let i = 0; i < anchors.length; i++) {
+    const postId = postIds[i];
+    if (!postId) continue;
+    const host = anchors[i].parentElement ?? anchors[i];
+    const existingBtn = host.querySelector<HTMLElement>(`:scope > ${INJECTED_BUTTON_SELECTOR}`);
+    if (existingBtn && existingBtn.dataset.fbxdlFor && existingBtn.dataset.fbxdlFor !== postId) {
+      existingBtn.remove();
+    }
+  }
+
   const alreadyInjectedPostIds = new Set(
     Array.from(document.querySelectorAll<HTMLElement>(INJECTED_BUTTON_SELECTOR))
       .map((el) => el.dataset.fbxdlFor)

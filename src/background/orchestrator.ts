@@ -230,6 +230,23 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const postId = redirect.get(delta.id);
     if (postId === undefined) return; // 自分の通常 DL ではない(zip は SW 側で先に処理)
 
+    if (cur === "interrupted") {
+      // 最終レビュー6巡目 P1: interrupted では redirect map の entry を削除
+      // しない(何もしない)。Chrome は同一 downloadId のまま resume する
+      // ことがある(NETWORK_* 等の一時的失敗からの自動/手動再開)ため、ここで
+      // entry を消してしまうと、resume 後に届く complete イベントで
+      // `redirect.get` が undefined になり、finalUrl allowlist 再検証
+      // (fail-closed)が丸ごとスキップされてしまう。entry を保持しておけば
+      // 後続の complete で必ず検証が効く。
+      //
+      // 二度と resume されなかった場合、この entry は永久に redirect map(と
+      // それを持続化する storage.session)に残り続けるが、(a) id→postId の
+      // 極小データに過ぎず、(b) storage.session はブラウザ終了で自動的に
+      // クリアされ、(c) 何より finalUrl のセキュリティ検証を取りこぼさない
+      // ことを優先する、という理由でこれを受容する。
+      return;
+    }
+
     // codex-review 指摘(4巡目): startDownload 側にも「persistRedirect() が
     // reject したら fail-closed で cancel/removeFile/erase する」経路があり、
     // これと当関数の finalUrl 検証がほぼ同時に同じ downloadId を触るレースが
@@ -243,12 +260,6 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     // ない(逆に startDownload 側が先に削除していれば、この関数は postId が
     // 引けず早期 return するので二重処理にもならない)。
     redirect.delete(delta.id);
-
-    if (cur === "interrupted") {
-      // 失敗は fire-and-forget(検証不要)。persist(除去の反映)は best-effort。
-      try { await persistRedirect(); } catch { /* 追跡データの持続化失敗は致命的ではない */ }
-      return;
-    }
 
     // 最終レビュー3巡目 P1: spec §変更 A / §4a-3 の finalUrl allowlist 再検証
     // (fail-closed)は、persist より必ず先に完了させる。旧実装は

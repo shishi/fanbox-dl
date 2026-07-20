@@ -105,16 +105,31 @@ describe("orchestrator fire-and-forget", () => {
     expect(d3.removed).toHaveLength(0);
   });
 
-  it("redirect map は complete/interrupted で除去される(未知 downloadId は無視)", async () => {
+  it("redirect map: complete で除去される(未知 downloadId は無視)。interrupted では除去しない(resume 後の complete で検証させるため)", async () => {
     const { deps, removed, setSearch } = mkDeps();
     const o = createOrchestrator(deps);
     await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
     // 未知の downloadId は無視される(自分の通常 DL ではない)
     await o.handleDownloadChanged({ id: 9999, state: { current: "complete", previous: "in_progress" } } as any);
     expect(removed).toHaveLength(0);
-    // interrupted は再検証せず単に map から除去される
+    // interrupted では検証しない(search は呼ばれない)が、map からも削除しない。
     setSearch(async () => { throw new Error("should not be called"); });
     await expect(o.handleDownloadChanged({ id: 101, state: { current: "interrupted", previous: "in_progress" } } as any)).resolves.toBeUndefined();
+  });
+
+  it("修正 P1(最終レビュー6巡目): interrupted の後に同一 downloadId で resume→complete が来ると finalUrl 検証が走る(interrupted で redirect map の entry が消えない)", async () => {
+    const { deps, removed, erased, setSearch } = mkDeps();
+    const o = createOrchestrator(deps);
+    await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
+    // 一時的な NETWORK_* 失敗などで interrupted になる(この時点では検証しない)。
+    await o.handleDownloadChanged({ id: 101, state: { current: "interrupted", previous: "in_progress" } } as any);
+    // Chrome が同一 downloadId のまま resume し、後続で complete が届く。
+    // interrupted で map の entry を削除していれば、ここで postId が引けず
+    // finalUrl 検証がスキップされてしまう(修正前の不具合)。
+    setSearch(async () => [{ id: 101, url: img("a").originalUrl, finalUrl: "https://evil.example.com/x.jpeg" } as any]);
+    await o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "interrupted" } } as any);
+    expect(removed).toContain(101);
+    expect(erased).toContain(101);
   });
 
   it("並行 DL: 2 件がほぼ同時に開始しても session 保存の redirect map から片方が消えない(persist レース回避)", async () => {

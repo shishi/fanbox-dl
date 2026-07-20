@@ -285,3 +285,69 @@ commit 8442228 (round5 初回)に対し native モードでレビューを実施
 `bun run build`(成功)で確認しながら進め、最終的に 1 コミット(`git commit --amend`
 で round5 コミットに集約、Conventional Commits の「1 コミット」要件を維持)。
 core 4 ファイルは全反復を通じて無変更。
+
+## 最終レビュー6巡目(automated 最終)修正
+
+対象: 自動レビューで指摘された 2 件。TDD(red→green)で修正。core(src/core/{template-engine,sanitizer,path-validator,base64}.ts)は無改造。
+
+### P1: interrupted→同一 downloadId で resume→complete が finalUrl 検証をスキップ
+
+`src/background/orchestrator.ts` `handleDownloadChanged`: 旧実装は
+`cur`(complete/interrupted)によらず redirect map から即座に `delete` していた
+ため、Chrome が同一 downloadId のまま resume して後続 complete が届くと
+`redirect.get` が undefined になり、finalUrl allowlist 再検証(fail-closed)が
+永久にスキップされていた。
+
+修正: `redirect.delete(delta.id)` を complete 確定後にのみ実行するよう移動し、
+interrupted 分岐は「何もしない(map を保持したまま return)」に簡素化(persist
+呼び出しも削除)。二度と resume されない entry は storage.session に残り続ける
+が、(a) id→postId の極小データ、(b) storage.session はブラウザ終了で自動
+クリア、(c) セキュリティ検証(fail-closed)を優先、の理由で受容し、コードコメ
+ントに明記した。complete 分岐の「同期的に delete → 検証 → persist」の順序と
+try/catch fail-closed(round5)は変更していない。
+
+テスト追加(tests/orchestrator.test.ts):
+「interrupted の後に同一 downloadId で resume→complete が来ると finalUrl
+検証が走る(interrupted で redirect map の entry が消えない)」— 修正前は
+red(removed が空)、修正後 green。既存の「redirect map は complete/
+interrupted で除去される」テストは、interrupted で map が除去されなくなった
+新仕様に合わせてタイトルと該当コメントを更新(挙動自体はこのテストの範囲では
+変化なし: interrupted は search を呼ばない)。
+
+### P2: 一覧カードの in-place href 差し替えで古い postId のボタンが残る
+
+`src/content/content-script.ts` `injectListButtons`: FANBOX が SPA/無限
+スクロールでカードの host ノードを再利用し anchor の href だけ差し替えると、
+既存ボタン(data-fbxdl-for)が古い postId を束縛したまま残り、
+alreadyInjectedPostIds 経由で再注入も抑止されるため、投稿 B のカードで
+押すと投稿 A がダウンロードされる不具合があった。
+
+修正: 注入走査の冒頭で、各 anchor の host が直接の子として持つ既存ボタン
+(host.querySelector(":scope > [data-fbxdl-for]"))の束縛 postId を現在の
+anchor href の postId と比較し、不一致なら stale として除去する。除去した分は
+その後の alreadyInjectedPostIds 集計から自動的に外れるため、同じ走査内で
+新 postId のボタンとして再注入される。一致すれば何もしない(従来どおり
+スキップ)。
+
+codex-review(native)1 回目の指摘: ":scope >" を付けず素の querySelector を
+使った初版では、入れ子 anchor 構造(共有コンテナ側の外側 anchor の host が
+個々のカード側の内側 anchor の host を子孫に含むケース)で、外側 anchor の
+走査時に無関係な別カードのボタンまで拾って誤除去してしまう欠陥があった。
+":scope >" で host の直接の子だけに限定して修正し、2 回目のレビューで
+clean(「discrete な欠陥は見つからない」)を確認した。
+
+ボタンの click ハンドラが握る postId は常にそのボタンが実在する host に
+対応する anchor の現在の href の postId と一致する、という不変条件をコード
+コメントに明記した。DOM 配線自体は既存方針により自動テスト対象外(手動確認)。
+
+### codex-review(native, iterate-until-clean)
+
+1 回目: P1/P2 の初回実装に対して実施 → [P1] injectListButtons の stale
+検出が host.querySelector(通常形、subtree 全体を探索)を使っており、
+入れ子 anchor 構造の共有コンテナ側 host から無関係な別カードのボタンを誤って
+除去し得る、との指摘。→ ":scope >" で host の直接の子のみに限定して修正。
+2 回目: 再レビュー → "did not find a discrete bug"(clean)。
+
+bun run test(142 tests green)・bun run typecheck(0 エラー)・
+bun run build(成功)を反復ごとに確認。core 4 ファイルは無変更
+(git diff --stat -- src/core/ → 出力なし)。1 コミットにまとめる。
