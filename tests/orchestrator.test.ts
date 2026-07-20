@@ -7,7 +7,7 @@ const postJson = (images: any[], over: any = {}) => ({ body: { post: { id: "1", 
 
 function mkDeps(over: Partial<OrchestratorDeps> = {}) {
   const downloaded: Array<{ url: string; filename: string; conflictAction?: string }> = [];
-  const erased: number[] = []; const removed: number[] = []; const logs: string[] = [];
+  const erased: number[] = []; const removed: number[] = []; const canceled: number[] = []; const logs: string[] = [];
   const mem: Record<string, unknown> = {};
   let nextId = 100;
   let searchImpl: (q: any) => Promise<any[]> = async () => [];
@@ -17,6 +17,7 @@ function mkDeps(over: Partial<OrchestratorDeps> = {}) {
       search: (q) => searchImpl(q),
       erase: async (q) => { erased.push((q as any).id); return [(q as any).id]; },
       removeFile: async (id) => { removed.push(id); },
+      cancel: async (id) => { canceled.push(id); },
     },
     loadSettings: async () => ({ ...DEFAULT_SETTINGS }),
     zip: { eligible: () => false, collect: async () => ({ ok: false, error: "x" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) },
@@ -25,7 +26,7 @@ function mkDeps(over: Partial<OrchestratorDeps> = {}) {
     log: (m) => logs.push(m),
     ...over,
   };
-  return { deps, downloaded, erased, removed, logs, mem, setSearch: (f: typeof searchImpl) => { searchImpl = f; } };
+  return { deps, downloaded, erased, removed, canceled, logs, mem, setSearch: (f: typeof searchImpl) => { searchImpl = f; } };
 }
 
 describe("orchestrator fire-and-forget", () => {
@@ -207,6 +208,138 @@ describe("orchestrator fire-and-forget", () => {
     await o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
     expect(getCalls).toBeGreaterThanOrEqual(3);
     expect(removed).toContain(101);
+  });
+
+  it("最終レビュー3巡目 P1: complete 処理中に persist(session.set)が reject しても finalUrl 検証(allowlist 外なら removeFile)が実行される", async () => {
+    let failSet = false;
+    const mem: Record<string, unknown> = {};
+    const { deps, removed, erased, setSearch } = mkDeps({
+      session: {
+        get: async (k) => ({ [k]: mem[k] }),
+        set: async (items) => {
+          if (failSet) throw new Error("session.set 失敗(容量超過等)");
+          Object.assign(mem, items);
+        },
+      },
+    });
+    const o = createOrchestrator(deps);
+    await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
+    failSet = true; // complete 処理中の(削除+persist)を失敗させる
+    setSearch(async () => [{ id: 101, url: img("a").originalUrl, finalUrl: "https://evil.example.com/x.jpeg" } as any]);
+    await expect(o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any)).resolves.toBeUndefined();
+    expect(removed).toContain(101);
+    expect(erased).toContain(101);
+  });
+
+  it("最終レビュー3巡目 P2: startDownload で persist(session.set)が reject → download が cancel+erase され errors に出る(追跡不能な DL を残さない)", async () => {
+    const { deps, canceled, erased, downloaded } = mkDeps({
+      session: {
+        get: async () => ({}),
+        set: async () => { throw new Error("session.set 失敗(容量超過等)"); },
+      },
+    });
+    const o = createOrchestrator(deps);
+    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
+    expect(downloaded).toHaveLength(1); // download 自体は一旦開始されている
+    expect(canceled.length).toBeGreaterThan(0);
+    expect(erased.length).toBeGreaterThan(0);
+    expect(res.errors.length).toBeGreaterThan(0);
+  });
+
+  it("codex-review 指摘: startDownload で persist が reject した時点で既に download が complete していても(cancel は no-op のため)removeFile でファイルを消す", async () => {
+    // 実ブラウザでは、非常に高速な DL は persist 失敗を検知する前に complete し得る。
+    // その場合 downloads.cancel() は no-op(complete 以外の状態からしかキャンセルできない)
+    // なので、erase だけでは履歴からは消えてもファイルはディスクに残ってしまう。
+    // removeFile も必ず呼ぶことで、cancel が効かないケースでも fail-closed にする。
+    const { deps, removed, erased } = mkDeps({
+      session: {
+        get: async () => ({}),
+        set: async () => { throw new Error("session.set 失敗(容量超過等)"); },
+      },
+    });
+    const o = createOrchestrator(deps);
+    await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
+    expect(removed.length).toBeGreaterThan(0);
+    expect(erased.length).toBeGreaterThan(0);
+  });
+
+  it("codex-review 指摘(3巡目): persist 失敗の検知より先に handleDownloadChanged が finalUrl 検証を完了(正当と判定)していた場合、後から届く persist 失敗で正当な DL を消してはいけない", async () => {
+    // startDownload の persistRedirect() が pending のまま(reject させるタイミングを
+    // 手動制御)にし、その間に「実ブラウザなら先に complete イベントが来て finalUrl
+    // 検証が完了していた」状況を handleDownloadChanged を直接呼んで模す。
+    let rejectSet: (e: unknown) => void = () => {};
+    const setPromise = new Promise<void>((_resolve, reject) => { rejectSet = reject; });
+    const { deps, removed, erased, canceled, setSearch } = mkDeps({
+      session: { get: async () => ({}), set: () => setPromise },
+    });
+    const o = createOrchestrator(deps);
+    const reqPromise = o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
+    // startDownload が download()→redirect.set→persistRedirect() の await で
+    // 止まるところまでマイクロタスクを進める(mkDeps の nextId 初期値 100 から
+    // 最初の download() 呼び出しは id 101 を返す)。
+    await new Promise((r) => setTimeout(r, 0));
+
+    // 正当な finalUrl で complete → handleDownloadChanged が検証(保持を決定)する。
+    // handleDownloadChanged 自身も末尾で persistRedirect() を(best-effort で)
+    // 呼ぶため、setPromise が解決するまでは完了しない → ここでは await せず、
+    // 検証の意思決定(removeFile/erase を呼ばない、という判断)が完了するのに
+    // 十分なだけマイクロタスクを進めてから途中経過を確認する。
+    setSearch(async () => [{ id: 101, url: img("a").originalUrl, finalUrl: img("a").originalUrl } as any]);
+    const chgPromise = o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(removed).toHaveLength(0); // 正当なので保持されている(この時点で判定済み)
+
+    // ここでようやく persist の失敗が両方(startDownload 側・handleDownloadChanged
+    // 側)に届く。
+    rejectSet(new Error("session.set 失敗(容量超過等)"));
+    await Promise.allSettled([reqPromise, chgPromise]);
+
+    // 既に正当と確定し保持された DL を、後から届いた persist 失敗で壊してはいけない。
+    expect(removed).toHaveLength(0);
+    expect(erased).toHaveLength(0);
+    expect(canceled).toHaveLength(0);
+  });
+
+  it("codex-review 指摘(4巡目): handleDownloadChanged の finalUrl 検証が『まだ進行中』(search() の応答待ち)の間に persist 失敗が届いても、検証中の DL を横取りして壊してはいけない", async () => {
+    // startDownload の persistRedirect() を pending にしておく。
+    let rejectSet: (e: unknown) => void = () => {};
+    const setPromise = new Promise<void>((_resolve, reject) => { rejectSet = reject; });
+    // downloads.search() も手動で resolve するまで pending にできるようにする。
+    let resolveSearch: (v: any[]) => void = () => {};
+    const searchPromise = new Promise<any[]>((resolve) => { resolveSearch = resolve; });
+    // mkDeps 既定の downloads(cancel/removeFile/erase の呼び出しを canceled/
+    // removed/erased 配列に記録する)をそのまま使い、search だけ差し替える。
+    const { deps, removed, erased, canceled, setSearch } = mkDeps({
+      session: { get: async () => ({}), set: () => setPromise },
+    });
+    setSearch(async () => searchPromise);
+    const o = createOrchestrator(deps);
+    const reqPromise = o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
+    await new Promise((r) => setTimeout(r, 0)); // startDownload が persistRedirect() の await で止まる
+
+    // complete イベント: postId を読み取り、redirect map から即座に削除した後、
+    // search() の応答待ちで止まる(finalUrl 検証がまだ「進行中」の状態)。
+    // mkDeps の download() は呼び出しごとに nextId をインクリメントして返すため
+    // (初期値 100)、この時点で発行済みの download id は 101。
+    const chgPromise = o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
+    await new Promise((r) => setTimeout(r, 0));
+
+    // ここで persist 失敗が startDownload 側に届く。検証はまだ進行中(未確定)だが、
+    // handleDownloadChanged が既にこの downloadId の結末を引き受け済み
+    // (redirect map から削除済み)なので、startDownload 側は手を出してはいけない。
+    rejectSet(new Error("session.set 失敗(容量超過等)"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(canceled).toHaveLength(0);
+    expect(removed).toHaveLength(0);
+    expect(erased).toHaveLength(0);
+
+    // 検証を完了させる(正当な finalUrl → 保持)。
+    resolveSearch([{ id: 101, url: img("a").originalUrl, finalUrl: img("a").originalUrl } as any]);
+    await Promise.allSettled([reqPromise, chgPromise]);
+
+    expect(removed).toHaveLength(0);
+    expect(erased).toHaveLength(0);
+    expect(canceled).toHaveLength(0);
   });
 });
 

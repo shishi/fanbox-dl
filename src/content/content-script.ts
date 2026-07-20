@@ -1,5 +1,5 @@
 import { fetchPostInfo } from "../fanbox/api";
-import { postIdFromPathname, postIdFromHref, isCreatorPostListPage } from "./dom-helpers";
+import { postIdFromPathname, postIdFromHref, isCreatorPostListPage, selectPostAnchorIndicesToInject } from "./dom-helpers";
 import type { DownloadRequestMessage, DownloadResponse } from "./messages";
 
 // 指定 postId の投稿を DL(content script が isolated world で post.info を fetch → SW へ)。
@@ -81,16 +81,43 @@ function whenReady(cb: () => void, timeoutMs = 6000) {
 }
 
 // --- クリエイター投稿一覧: 各カードに ⬇ ---
+// 最終レビュー3巡目 P3: 1 投稿カードにサムネ・タイトルなど複数の /posts/{id}
+// anchor があると、anchor 単位でボタンを付けていた旧実装では同一投稿へ
+// ボタンが重複表示された。postId 単位で dedup する。
+//
+// codex-review 指摘(累積): dedup の判定材料を anchor 側のマーカー(data-fbxdl)に
+// 頼る設計は、マーカーをどこに置いても DOM の部分的な再レンダリングで破綻し得る
+// ―― 選んだ 1 anchor だけにマークすればそのマーカーだけ消えて重複注入し、同じ
+// postId の anchor 全部にマークすれば、逆に実際にボタンを保持している
+// anchor/host だけが消えてマーカーだけ生き残り、ボタンが無いのに「既にある」と
+// 誤判定して永久に再注入されなくなる。マーカー(anchor 側)と実体(ボタンの生存)
+// が別の DOM ノードにある限りこの手の乖離は避けられない。
+//
+// そのため anchor には一切マークせず、ボタン自身に「どの postId 用か」を
+// 記録し(data-fbxdl-for)、「既にボタンがあるか」は現在の DOM に実在する
+// ボタン要素を数え上げて判定する。ボタンの DOM ノードが(anchor 差し替え・
+// host 差し替え・カード全体の再レンダリングいずれの理由であれ)消えれば、
+// 次回呼び出しで自動的に「無い」ことになり、判定がボタンの実在と常に一致する
+// (呼び出しをまたぐ独立した状態を持たない)。
+const INJECTED_BUTTON_SELECTOR = "[data-fbxdl-for]";
 function injectListButtons() {
   const selector = 'a[href*="/posts/"]';
   const anchors: HTMLAnchorElement[] = Array.from(document.querySelectorAll(selector));
-  for (const anchor of anchors) {
-    const postId = postIdFromHref(anchor.getAttribute("href") || "");
-    if (!postId || anchor.dataset.fbxdl === "1") continue;
-    anchor.dataset.fbxdl = "1";
+  const postIds = anchors.map((a) => postIdFromHref(a.getAttribute("href") || ""));
+  const alreadyInjectedPostIds = new Set(
+    Array.from(document.querySelectorAll<HTMLElement>(INJECTED_BUTTON_SELECTOR))
+      .map((el) => el.dataset.fbxdlFor)
+      .filter((id): id is string => !!id)
+  );
+  const indices = selectPostAnchorIndicesToInject(postIds, alreadyInjectedPostIds);
+  for (const i of indices) {
+    const anchor = anchors[i];
+    const postId = postIds[i];
+    if (!postId) continue;
     const host = anchor.parentElement ?? anchor;
     if (getComputedStyle(host).position === "static") host.style.position = "relative";
     const btn = makeDlButton("⬇", true, () => runDownloadFor(postId));
+    btn.dataset.fbxdlFor = postId; // このボタンがどの postId 用かを記録(生存確認に使う)
     Object.assign(btn.style, { position: "absolute", top: "6px", right: "6px", zIndex: "9999" });
     host.appendChild(btn);
   }
@@ -108,7 +135,12 @@ function sync() {
   if (onList) injectListButtons();
 }
 function watch() {
-  const check = () => { if (location.pathname !== lastPath) { lastPath = location.pathname; sync(); } };
+  const check = () => {
+    if (location.pathname !== lastPath) {
+      lastPath = location.pathname;
+      sync();
+    }
+  };
   window.addEventListener("popstate", check);
   setInterval(check, 1000);
   // 一覧の無限スクロール等でカードが増えるのを拾う(現在が一覧のときのみ注入)

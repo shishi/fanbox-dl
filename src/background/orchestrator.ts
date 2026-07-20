@@ -28,6 +28,7 @@ export interface OrchestratorDeps {
     search(q: chrome.downloads.DownloadQuery): Promise<chrome.downloads.DownloadItem[]>;
     erase(q: chrome.downloads.DownloadQuery): Promise<number[]>;
     removeFile(id: number): Promise<void>;
+    cancel(id: number): Promise<void>;
   };
   loadSettings: () => Promise<Settings>;
   zip: {
@@ -108,7 +109,40 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (!v.ok) throw new Error(`allowlist 違反: ${v.error}`);
     const id = await deps.downloads.download({ url, filename, saveAs: false, conflictAction: CONFLICT_ACTION });
     redirect.set(id, postId);
-    await persistRedirect();
+    // 最終レビュー3巡目 P2: persist(session.set)が失敗すると、DL 自体は継続するが
+    // downloadId→postId の対応が in-memory にしか無くなる。SW 再起動でこの対応が
+    // 失われると、complete 時の finalUrl fail-closed 検証が永久にスキップされ、
+    // 追跡不能な DL がディスクに残る。それを避けるため、persist に失敗したら
+    // download 自体を cancel + removeFile + erase して fail-closed(この DL を
+    // 無かったことにする)。cancel は「まだ進行中」を、removeFile は「cancel が
+    // 間に合わないほど高速に complete していた」を、それぞれカバーする
+    // (chrome.downloads.cancel() の Promise は cancelled/completed/interrupted
+    // のいずれかに状態が確定してから resolve するため、両者は排他的に効く。
+    // 拡張機能からの cancel が生む中断理由 USER_CANCELED は resume 前提の
+    // 一時的ネットワーク障害とは異なり、再開可能な部分ファイルを残さない)。
+    //
+    // codex-review 指摘(3巡目・4巡目): この persistRedirect() が reject する
+    // より前に、同じ downloadId の complete イベントが先に届いて
+    // handleDownloadChanged が finalUrl 検証を(開始 or 完了)済みというレースが
+    // あり得る。handleDownloadChanged は「この downloadId の結末を引き受ける」と
+    // 決めた瞬間(検証を始める前、await を挟まず同期的に)redirect map から
+    // 削除するため、ここで `redirect.has(id)` が false なら、それは
+    // 「検証が完了済みか進行中かによらず、既に handleDownloadChanged が結末を
+    // 引き受けた」ことを意味する(JS の同期実行区間は中断されないため、検証の
+    // 開始と削除の間に割り込むことはできない)。その場合は後追いで
+    // cancel/removeFile/erase を呼んで正当な DL を壊してはいけない(persist
+    // 失敗自体は呼び出し側の errors には載せる)。
+    try {
+      await persistRedirect();
+    } catch (e) {
+      if (redirect.has(id)) {
+        redirect.delete(id);
+        try { await deps.downloads.cancel(id); } catch { /* best-effort */ }
+        try { await deps.downloads.removeFile(id); } catch { /* best-effort */ }
+        try { await deps.downloads.erase({ id }); } catch { /* best-effort */ }
+      }
+      throw new Error(`redirect map の永続化に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   async function handleDownloadRequest(msg: DownloadRequestMessage): Promise<DownloadResponse> {
@@ -195,11 +229,31 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (cur !== "complete" && cur !== "interrupted") return;
     const postId = redirect.get(delta.id);
     if (postId === undefined) return; // 自分の通常 DL ではない(zip は SW 側で先に処理)
-    redirect.delete(delta.id);
-    await persistRedirect();
-    if (cur === "interrupted") return; // 失敗は fire-and-forget(検証不要)
 
-    // spec §変更 A / §4a-3: 完了時に finalUrl を allowlist 再検証、fail-closed。
+    // codex-review 指摘(4巡目): startDownload 側にも「persistRedirect() が
+    // reject したら fail-closed で cancel/removeFile/erase する」経路があり、
+    // これと当関数の finalUrl 検証がほぼ同時に同じ downloadId を触るレースが
+    // あり得る。検証完了「後」に削除すると、startDownload 側の経路が検証
+    // 進行中(まだ削除前)の downloadId を横から掴んで壊してしまう窓が生まれる
+    // ため、この関数がこの downloadId の結末を引き受けると決めた瞬間
+    // ―― つまり検証を始める前、await を挟まず同期的に ―― redirect map から
+    // 削除し、以後の結末(保持するか破棄するか)はこの関数だけが決める、と
+    // 宣言する。JS はこの同期区間を中断できないため、startDownload 側が
+    // `redirect.has(id)` を見て「既にこちらが引き受けた」ことを見逃すことは
+    // ない(逆に startDownload 側が先に削除していれば、この関数は postId が
+    // 引けず早期 return するので二重処理にもならない)。
+    redirect.delete(delta.id);
+
+    if (cur === "interrupted") {
+      // 失敗は fire-and-forget(検証不要)。persist(除去の反映)は best-effort。
+      try { await persistRedirect(); } catch { /* 追跡データの持続化失敗は致命的ではない */ }
+      return;
+    }
+
+    // 最終レビュー3巡目 P1: spec §変更 A / §4a-3 の finalUrl allowlist 再検証
+    // (fail-closed)は、persist より必ず先に完了させる。旧実装は
+    // 「削除 → persist → 検証」の順だったため、persist(session.set)が throw
+    // すると検証(removeFile 等)に到達しないまま関数が終了してしまっていた。
     const [item] = await deps.downloads.search({ id: delta.id });
     // fail-closed(spec §変更 A): finalUrl が無いとき url(要求 URL)で代用しない。
     const finalUrl = (item as any)?.finalUrl as string | undefined;
@@ -208,6 +262,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       try { await deps.downloads.erase({ id: delta.id }); } catch {}
       deps.log(`[fanbox-dl] 許可外 URL へリダイレクトされた可能性があるためダウンロードを破棄しました(postId ${postId})`); // spec §変更 A: click 応答返却後のため console が通知チャネル(zip と同じ制約)
     }
+
+    // 検証完了後に persist。ここで persist が失敗しても、fail-closed 検証は
+    // 既に完了済みなので致命的ではない(best-effort)。
+    try { await persistRedirect(); } catch { /* 追跡データの持続化失敗は致命的ではない(検証は既に完了済み) */ }
   }
 
   return { handleDownloadRequest, handleDownloadChanged, loadRedirectMap };

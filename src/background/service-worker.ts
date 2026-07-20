@@ -10,6 +10,7 @@ const orchestrator = createOrchestrator({
     search: (q) => chrome.downloads.search(q),
     erase: (q) => chrome.downloads.erase(q),
     removeFile: (id) => chrome.downloads.removeFile(id),
+    cancel: (id) => chrome.downloads.cancel(id),
   },
   loadSettings,
   zip: { eligible: zipEligible, collect: collectZipSources, build: buildZip, downloadViaOffscreen: downloadZipViaOffscreen },
