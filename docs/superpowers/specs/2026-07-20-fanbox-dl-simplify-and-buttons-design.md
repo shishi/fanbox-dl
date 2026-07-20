@@ -28,8 +28,12 @@ dedup をやめると「二度 DL しない/中断を追跡する」ための仕
 - 鮮度: updatedDatetime 警告(pendingPostUpdatedAt / lastDownloadedPostUpdatedAt /
   lastWarnedPostUpdatedAt)
 - UI: **🔄(再ダウンロード)ボタンを削除**(毎回の ⬇ がそのまま再 DL になり意味が消えるため)
-- リダイレクト対策のうち **finalUrl 再検証(原設計 §4a-3)は撤去**(ledger の error マークに
-  依存していたため)。**DL 前の URL allowlist 検証(host+path 形状+postId 一致)は維持**。
+- **DL 前の URL allowlist 検証(host+path 形状+postId 一致)は維持**。
+- **finalUrl リダイレクト再検証(原設計 §4a-3)は軽量な形で維持する**(dedup とは別の
+  独立セキュリティ制御。DL 前 allowlist は初期 URL しか見ず chrome.downloads はリダイレクトを
+  追うため、これが唯一のリダイレクト検出経路)。ledger は復活させず、**`downloadId → postId` の
+  小さな Map(SW メモリ + `chrome.storage.session` に同期し SW 再起動耐性を持たせる)** と
+  下記の通常 DL 用 onChanged だけで実現する。詳細は撤去後フロー 5 を参照。
 
 ### 撤去後のダウンロードフロー(normative)
 1. content script が isolated world で `post.info` を fetch(原設計 §4a canonical・**変更なし**)し、
@@ -42,9 +46,16 @@ dedup をやめると「二度 DL しない/中断を追跡する」ための仕
    **投げっぱなし(結果を永続追跡しない)**。
 3. 同名衝突は Chrome の `uniquify`(`foo (1).ext`)に委ねる。DL 済み判定・resume・
    再投入は行わない。
-4. **zip 経路は維持**(原設計 §7b。元々 one-shot で履歴外)。`chrome.downloads.onChanged` は
-   **zip の blob URL revoke(offscreen リーク防止)のためだけ**に残し、通常 DL の完了/中断を
-   追跡する分岐は削除する。zip 不成立時の個別 DL フォールバック(§7b)も維持。
+4. **zip 経路は維持**(原設計 §7b。元々 one-shot で履歴外)。zip 不成立時の個別 DL
+   フォールバック(§7b)も維持。
+5. **通常 DL の onChanged は「finalUrl リダイレクト検出」のためだけに軽量に残す**
+   (完了/中断の永続追跡・resume・needs_page は行わない)。`download()` 成功時に
+   `downloadId → postId` を Map に記録(storage.session 同期)。`onChanged` の complete で
+   その downloadId が Map にあれば `DownloadItem.finalUrl` を `validateMediaUrl(finalUrl, postId)`
+   で照合し、**allowlist 外なら `chrome.downloads.removeFile` + `erase` してユーザーに
+   明示通知**(「許可外 URL へリダイレクトされたためダウンロードを破棄しました」)。
+   照合後(成功・失敗どちらでも)Map から除去。zip の blob URL revoke 用の onChanged 分岐も
+   併存する(既存)。この Map は dedup には一切使わない(照合が済めば消える揮発データ)。
 
 ### 識別子の扱い
 `stableContentId` / `blockOrdinal` の分離(原設計 §6)は render のためではなく主に dedup 用だった。
@@ -75,15 +86,24 @@ fanbox は pixiv の SPA でクラス名がハッシュ化されるため、**�
   小さな ⬇ ボタンを 1 個注入する。
 - クリックでそのカードの postId の post.info を isolated world で fetch → SW で投稿全体を DL
   (投稿ページのボタンと同一フロー。トリガが変わるだけ)。
+- **クリック時は `preventDefault()` + `stopPropagation()` でカードのリンク遷移を必ず抑止する**
+  (クリック可能カードに素朴に注入すると「DL しつつ投稿ページへ遷移」してしまうため)。
+  ボタンはカードのアンカー hit 領域と重ならない位置(カード角のオーバーレイ等)に置く。
 - 無限スクロール・SPA 遷移で増えるカードにも `MutationObserver` で注入。重複注入は
   postId またはボタン要素のデータ属性でガードする。
 - **クリエイター投稿一覧の面でのみ有効化**(URL 判定)。ホーム / タグ / フォロー中は対象外。
+- **実装時の hard gate(オリジン確認)**: 原設計が 200 を実証したのは `www.fanbox.cc` オリジンの
+  投稿ページのみ。クリエイター投稿一覧ページの**実行オリジンで isolated-world の `post.info`
+  fetch が 200 になること**を実機で確認してから一覧ボタンを有効化する。一覧ページが
+  `{creator}.fanbox.cc` オリジンで動き api が 400 を返す場合は、一覧ボタン機能を**見送り**
+  (投稿ページのタイトル近く配置のみ実装)、別途 spec 改訂で www オリジン経由の取得手段を設計する。
+  投稿ページ側は www 正規化済み(原設計 §4a)なので影響しない。
 
 ### 共通
 - content script の matches は `https://*.fanbox.cc/*` 全域常駐のまま(原設計 §12・SPA 対応)。
 - クリックのフィードバックは現状維持(`⬇ N 件開始` 等の一時テキスト差し替え)。
-- 一覧の各カードからの DL は、content script の isolated world fetch がどの fanbox.cc ページからでも
-  任意 postId の post.info を 200 で引ける(gate §13-6 v2 で実証)ことに依存する。
+- 一覧の各カードからの DL は、content script の isolated world fetch が一覧ページの実行オリジンから
+  任意 postId の post.info を 200 で引けること(上記 hard gate)に依存する。
 
 ## テスト方針
 - 削除対象のテスト群(ledger / job-store / mutation-queue / adoption / settle /
@@ -92,7 +112,9 @@ fanbox は pixiv の SPA でクラス名がハッシュ化されるため、**�
   (image / file / article / restricted / text / embed カウント の各フィクスチャは維持)。
 - render-adapter / url-allowlist / zip / template・sanitizer・path-validator(core)テストは維持。
 - orchestrator は fire-and-forget フローに合わせて再構成(zip フォールバック / allowlist 違反で
-  download() 不到達 / restricted 通知 の契約テストは維持。dedup / needs_page / finalUrl 系テストは削除)。
+  download() 不到達 / restricted 通知 の契約テストは維持。dedup / needs_page 系テストは削除。
+  **finalUrl リダイレクト検出テストは維持**: complete で finalUrl が allowlist 外なら
+  removeFile+erase+通知され、downloadId→postId Map から除去される契約をテストする)。
 - content script のボタン検出(href パターンでの postId 抽出・カードのユニーク化・title 検出の
   フォールバック判定)は**純粋関数として切り出して単体テスト**する(DOM 配線自体は手動確認)。
 
