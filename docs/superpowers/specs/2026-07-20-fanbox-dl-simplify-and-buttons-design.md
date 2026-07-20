@@ -54,8 +54,14 @@ dedup をやめると「二度 DL しない/中断を追跡する」ための仕
    その downloadId が Map にあれば `DownloadItem.finalUrl` を `validateMediaUrl(finalUrl, postId)`
    で照合し、**allowlist 外なら `chrome.downloads.removeFile` + `erase` してユーザーに
    明示通知**(「許可外 URL へリダイレクトされたためダウンロードを破棄しました」)。
-   照合後(成功・失敗どちらでも)Map から除去。zip の blob URL revoke 用の onChanged 分岐も
-   併存する(既存)。この Map は dedup には一切使わない(照合が済めば消える揮発データ)。
+   **fail-closed(normative)**: complete 時に `chrome.downloads.search({id})` で完全な
+   `DownloadItem` を取得し、item が得られない/`finalUrl` を確定できない場合は「検証済み」と
+   みなさず、上記と同じ破棄+通知に倒す(finalUrl が唯一のリダイレクト検出経路になったため、
+   未確認を成功扱いしない)。照合後(成功・失敗・未確認どれでも)Map から除去。zip の blob URL
+   revoke 用の onChanged 分岐も併存する(既存)。この Map は dedup には一切使わない
+   (照合が済めば消える揮発データ)。
+   テスト: (a) finalUrl が allowlist 外 → 破棄+通知、(b) **item/finalUrl が取得不能 → fail-closed で
+   破棄+通知**、(c) 正常 finalUrl → 何もしない、の 3 ケースを orchestrator テストで固定。
 
 ### 識別子の扱い
 `stableContentId` / `blockOrdinal` の分離(原設計 §6)は render のためではなく主に dedup 用だった。
