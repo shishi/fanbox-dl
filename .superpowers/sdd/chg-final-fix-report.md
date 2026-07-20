@@ -223,3 +223,65 @@ core 無改造: 確認済み
 ### codex-review
 
 実施なし(純粋 helper 単一関数の外部ホスト検査で完結、デザインレビュー必要なし)。
+
+## 最終レビュー第5巡 修正(round5)
+
+対象: 前回レビュー(4巡)で残った2件の指摘。
+
+### P2b: finalUrl 検証中に downloads.search が reject すると検証を失う
+
+- ファイル: `src/background/orchestrator.ts` の `handleDownloadChanged` complete 分岐。
+- 修正: search → finalUrl 取得 → allowlist 照合の検証ブロック全体を try/catch で包み、
+  例外発生時も removeFile + erase + log を実行して fail-closed にした。
+  「allowlist 外」「item/finalUrl 取得不能」「検証中に例外」の全パターンで破棄に倒す。
+- `redirect.delete(delta.id)` の同期実行位置(検証開始前)は変更していない
+  (round4 の startDownload 側とのレース回避を維持)。
+- テスト追加: tests/orchestrator.test.ts「最終レビュー5巡目 P2b: complete 処理中に
+  downloads.search が reject しても fail-closed で removeFile/erase される」。
+  TDD で RED(reject が伝播して assertion 失敗)→ GREEN(fail-closed)を確認。
+
+### P2a: 投稿ページボタンが subtree 再描画で消えると再注入されない
+
+- ファイル: `src/content/content-script.ts` の `watch()`。
+- 修正: 既存の 1 秒間隔 `check()` 内で、pathname 変化検知とは独立に、
+  「投稿ページ(postIdFromPathname != null)なのに #fbxdl-post-btn が存在しない」場合
+  placePostButton() を呼んで再注入するチェックを追加。
+  placePostButton 自身の #fbxdl-post-btn 存在ガードで冪等性(二重注入防止)は担保。
+- この DOM 配線は既存方針どおり自動テスト対象外(手動確認)。
+
+### 完了確認
+
+- `bun run test`: 141 tests passed (12 files)。
+- `bun run typecheck`: エラー 0。
+- `bun run build`: 成功(4 バンドル出力)。
+- core 無変更確認: `git diff --stat f67156f..HEAD -- src/core/template-engine.ts
+  src/core/sanitizer.ts src/core/path-validator.ts src/core/base64.ts` → 出力なし(空)。
+- 追加テスト数: 1(orchestrator.test.ts)。content-script.ts の P2a は既存方針により
+  自動テスト対象外。
+
+### codex-review (native, iterate-until-clean)
+
+commit 8442228 (round5 初回)に対し native モードでレビューを実施し、指摘が
+無くなるまで review→fix→re-review を反復した(計 4 回、うち 3 回で修正)。
+
+1. 回目: P2b/P2a の初回実装に対して実施 → [P3] title サブトゥリーが一時的に
+   消えてフォールバック(固定右下)配置になった後、title が復元されても
+   `placePostButton()` の早期 return ガードのままだと永久にフォールバック位置に
+   固定される、との指摘。→ `placePostButton()` にフォールバック→title への
+   付け替えロジックを追加して修正。
+2. 回目: 上記修正後に再レビュー → [P3] `watch()` 側の再注入チェックが
+   「ボタンが存在するか」のみで判定しているため、フォールバック配置後は
+   `placePostButton()` 自体が二度と呼ばれず、1 回目の修正が実質デッドコードに
+   なる、との指摘。→ `watch()` の判定を「ボタンが無い、またはフォールバック
+   配置中」に変更して修正。
+3. 回目: 再レビュー → [P2] フォールバック→title への付け替えで既存ボタンを
+   remove()+新規生成していたため、クリック直後で in-flight(disabled=true)な
+   状態がリセットされ、ユーザーが再クリックして同一投稿を二重ダウンロードし
+   得る、との指摘。→ remove()+新規生成をやめ、既存 DOM ノードをそのまま
+   (disabled 状態・イベントリスナーを保ったまま)本来の位置へ移動するよう修正。
+4. 回目: 再レビュー → "I did not find a discrete, actionable bug"(clean)。
+
+いずれの反復も `bun run test`(141 tests green)・`bun run typecheck`(0 エラー)・
+`bun run build`(成功)で確認しながら進め、最終的に 1 コミット(`git commit --amend`
+で round5 コミットに集約、Conventional Commits の「1 コミット」要件を維持)。
+core 4 ファイルは全反復を通じて無変更。

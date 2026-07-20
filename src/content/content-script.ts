@@ -56,20 +56,42 @@ function findTitleAnchor(): HTMLElement | null {
 // クロージャの postId を握ったままだと旧投稿がずっと DL されてしまう。
 // カードボタン(injectListButtons)は各カード固有の postId を握ったままで正しいので対象外。
 function placePostButton() {
-  if (document.getElementById(POST_CONTAINER_ID)) return;
+  const existing = document.getElementById(POST_CONTAINER_ID);
+  const title = findTitleAnchor();
+  // 最終レビュー修正 P3(round5 codex-review 指摘): title サブトゥリーが一時的に
+  // 見つからずフォールバック(固定右下)に置いた場合、単純な「ボタンが有れば
+  // return」ガードのままだと、その後 title サブトゥリーが非同期に復元されても
+  // 永久にフォールバック位置へ固定されてしまう(P2a の再注入チェックはボタンの
+  // 有無しか見ないため)。フォールバック配置中に限り、title が見つかった時点で
+  // 本来の位置へ付け替える(既に title 直後にある場合はここで何もしない=冪等)。
+  if (existing) {
+    if (existing.dataset.fbxdlPlacement === "title" || !title || !title.parentElement) return;
+    // codex-review 指摘(round5 P2): ここで既存ボタンを remove() して新規に
+    // 作り直すと、ユーザーが既にクリック済みで runDownloadFor() が in-flight
+    // (b.disabled = true 済み、テキストも変更済み)の場合にその状態が失われ、
+    // 生まれ変わった新ボタンは disabled=false の初期状態になる。ユーザーが
+    // 再クリックできてしまい、同じ投稿が二重にダウンロードされ得る。
+    // そのため作り直さず、既存の DOM ノードをそのまま(disabled 状態や
+    // イベントリスナーを保ったまま)本来の位置へ移動するだけにする。
+    Object.assign(existing.style, { position: "", right: "", bottom: "", zIndex: "", marginLeft: "12px" });
+    title.insertAdjacentElement("afterend", existing);
+    existing.dataset.fbxdlPlacement = "title";
+    return;
+  }
   const btn = makeDlButton("⬇ fanbox-dl", false, () => {
     const currentPostId = postIdFromPathname(location.pathname);
     return currentPostId ? runDownloadFor(currentPostId) : Promise.resolve(null);
   });
   btn.id = POST_CONTAINER_ID;
-  const title = findTitleAnchor();
   if (title && title.parentElement) {
     btn.style.marginLeft = "12px";
     title.insertAdjacentElement("afterend", btn);
+    btn.dataset.fbxdlPlacement = "title";
   } else {
     // フォールバック: 固定右下(必ず出る)
     Object.assign(btn.style, { position: "fixed", right: "16px", bottom: "16px", zIndex: "99999" });
     document.body.appendChild(btn);
+    btn.dataset.fbxdlPlacement = "fallback";
   }
 }
 function whenReady(cb: () => void, timeoutMs = 6000) {
@@ -139,6 +161,24 @@ function watch() {
     if (location.pathname !== lastPath) {
       lastPath = location.pathname;
       sync();
+    }
+    // 最終レビュー修正 P2a: 投稿ページボタンは title サブトゥリー内に挿入される
+    // ため、FANBOX がその subtree を再描画するとボタンごと消えることがある。
+    // pathname は変わらないので上の分岐では拾えない。pathname 変化検知とは
+    // 独立に、毎周期「投稿ページなのにボタンが無い」かを確認して復活させる
+    // (placePostButton は #fbxdl-post-btn 存在ガードで冪等 = 二重注入しない)。
+    //
+    // codex-review 指摘(round5 P3): ここで「ボタンが存在するか」だけを見て
+    // 判定すると、title が一時的に見つからずフォールバック(固定右下)配置に
+    // なった場合、以後 #fbxdl-post-btn は存在し続けるためこの分岐が二度と
+    // 実行されず、placePostButton() 内に追加した「title 復元後の付け替え」
+    // ロジックが呼ばれる機会自体が失われる。フォールバック配置中は毎周期
+    // placePostButton() を呼び続け、title が復元され次第そちら側で本来の
+    // 位置へ付け替えられるようにする(placePostButton は title 直後に正しく
+    // 配置済みなら何もしない=冪等)。
+    if (postIdFromPathname(location.pathname) !== null) {
+      const btn = document.getElementById(POST_CONTAINER_ID);
+      if (!btn || btn.dataset.fbxdlPlacement === "fallback") placePostButton();
     }
   };
   window.addEventListener("popstate", check);

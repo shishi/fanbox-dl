@@ -341,6 +341,19 @@ describe("orchestrator fire-and-forget", () => {
     expect(erased).toHaveLength(0);
     expect(canceled).toHaveLength(0);
   });
+
+  it("最終レビュー5巡目 P2b: complete 処理中に downloads.search が reject しても fail-closed で removeFile/erase される", async () => {
+    const { deps, removed, erased, logs, setSearch } = mkDeps();
+    const o = createOrchestrator(deps);
+    await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
+    // search が reject する(ブラウザ内部エラー等)。finalUrl 検証に到達できない。
+    setSearch(async () => { throw new Error("search 失敗(一時的なブラウザ内部エラー等)"); });
+    await expect(o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any)).resolves.toBeUndefined();
+    // 検証できなかった以上、fail-closed で破棄する(allowlist 外・item 無し・finalUrl 欠落と同様)。
+    expect(removed).toContain(101);
+    expect(erased).toContain(101);
+    expect(logs.some((l) => l.includes("破棄"))).toBe(true);
+  });
 });
 
 describe("safeReplacement(最終レビュー修正 P2: 保存済み illegalCharReplacement の実行時中和)", () => {

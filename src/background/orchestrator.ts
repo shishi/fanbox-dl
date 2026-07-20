@@ -254,13 +254,25 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     // (fail-closed)は、persist より必ず先に完了させる。旧実装は
     // 「削除 → persist → 検証」の順だったため、persist(session.set)が throw
     // すると検証(removeFile 等)に到達しないまま関数が終了してしまっていた。
-    const [item] = await deps.downloads.search({ id: delta.id });
-    // fail-closed(spec §変更 A): finalUrl が無いとき url(要求 URL)で代用しない。
-    const finalUrl = (item as any)?.finalUrl as string | undefined;
-    if (!item || !finalUrl || !validateMediaUrl(finalUrl, postId).ok) {
+    //
+    // 最終レビュー5巡目 P2b: 検証ブロック自体(search → finalUrl 取得 →
+    // allowlist 照合)を try/catch で包む。downloads.search() が reject する
+    // (ブラウザ内部エラー等)と、上記と同じ理由で検証に到達できず、リダイレクト
+    // 済みの実ファイルがディスクに残ってしまう。「allowlist 外」「item/finalUrl
+    // 取得不能」と同様、「検証中に例外」も fail-closed(破棄)に倒す。
+    try {
+      const [item] = await deps.downloads.search({ id: delta.id });
+      // fail-closed(spec §変更 A): finalUrl が無いとき url(要求 URL)で代用しない。
+      const finalUrl = (item as any)?.finalUrl as string | undefined;
+      if (!item || !finalUrl || !validateMediaUrl(finalUrl, postId).ok) {
+        try { await deps.downloads.removeFile(delta.id); } catch {}
+        try { await deps.downloads.erase({ id: delta.id }); } catch {}
+        deps.log(`[fanbox-dl] 許可外 URL へリダイレクトされた可能性があるためダウンロードを破棄しました(postId ${postId})`); // spec §変更 A: click 応答返却後のため console が通知チャネル(zip と同じ制約)
+      }
+    } catch (e) {
       try { await deps.downloads.removeFile(delta.id); } catch {}
       try { await deps.downloads.erase({ id: delta.id }); } catch {}
-      deps.log(`[fanbox-dl] 許可外 URL へリダイレクトされた可能性があるためダウンロードを破棄しました(postId ${postId})`); // spec §変更 A: click 応答返却後のため console が通知チャネル(zip と同じ制約)
+      deps.log(`[fanbox-dl] finalUrl 検証中にエラーが発生したためダウンロードを破棄しました(postId ${postId}): ${e instanceof Error ? e.message : String(e)}`);
     }
 
     // 検証完了後に persist。ここで persist が失敗しても、fail-closed 検証は
