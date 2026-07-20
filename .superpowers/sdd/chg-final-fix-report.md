@@ -172,3 +172,54 @@ core 無改造: `git diff --stat f67156f..HEAD -- src/core/{template-engine,sani
 - `bun run build`: 成功(content-script.js 7.6kb / service-worker.js 47.9kb
   / options.js 12.0kb / offscreen.js 1.5kb)
 - core 4 ファイル差分: 空
+
+## 最終レビュー第4巡: postIdFromHref 外部ホスト検査(TDD)
+
+対象コミット: b2cf1ef
+対象ファイル: src/content/dom-helpers.ts / tests/dom-helpers.test.ts
+core 無改造: 確認済み
+
+### 修正内容
+
+- **問題**: `postIdFromHref` は絶対 URL を pathname に落とすだけでホスト検査が無く、
+  `https://example.com/posts/123` を fanbox 投稿 123 と誤認する。一覧ページの
+  外部リンクに DL ボタンが付き誤 DL する。
+
+- **修正**: `postIdFromHref(href)`: 絶対 URL の場合は host が `fanbox.cc` または
+  `*.fanbox.cc` のときだけ postId を返す(それ以外は null)。相対 URL(host 無し)は
+  従来どおり許可。実装例:
+  ```ts
+  export function postIdFromHref(href: string): string | null {
+    try {
+      const u = new URL(href, "https://www.fanbox.cc");
+      // 絶対 URL で fanbox 以外のホストは対象外(外部リンク誤認防止)
+      if (u.host !== "fanbox.cc" && !u.host.endsWith(".fanbox.cc")) return null;
+      return postIdFromPathname(u.pathname);
+    } catch {
+      return null;
+    }
+  }
+  ```
+  (相対 href は base 補完で www.fanbox.cc になり host 判定を通る。)
+
+- **テスト追加**(tests/dom-helpers.test.ts postIdFromHref describe):
+  1. `https://example.com/posts/123` → null(外部ホスト拒否)
+  2. `https://twitter.com/posts/456` → null(外部ホスト拒否)
+  3. `https://ropy.fanbox.cc/posts/12272980` → `"12272980"`(fanbox サブドメイン許可)
+  4. `/@ropy/posts/12272980`(相対) → `"12272980"`(従来どおり許可)
+
+### 完了確認
+
+- `bun run test`: 140 tests(12 files), all green
+  - dom-helpers.test.ts: 15 → 18 tests (+3 外部ホスト検査)
+- `bun run typecheck`: `tsc --noEmit`, エラー 0
+- `bun run build`: 成功
+  - dist/content/content-script.js 7.7kb
+  - dist/background/service-worker.js 47.9kb
+  - dist/options/options.js 12.0kb
+  - dist/offscreen/offscreen.js 1.5kb
+- core 4 ファイル無変更
+
+### codex-review
+
+実施なし(純粋 helper 単一関数の外部ホスト検査で完結、デザインレビュー必要なし)。
