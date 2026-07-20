@@ -109,22 +109,6 @@ async function init() {
     setTimeout(() => ($("saved").textContent = ""), 2000);
   });
 
-  $("clearHistory").addEventListener("click", async () => {
-    if (!confirm("DL 履歴を全部クリアしますか?(同じ投稿を再度クリックすると再ダウンロードされるようになります)")) return;
-    const btn = $("clearHistory") as HTMLButtonElement;
-    btn.disabled = true;
-    try {
-      const res = await chrome.runtime.sendMessage({ kind: "clearHistory" });
-      if (res?.ok) {
-        $("clearedNotice").textContent = "履歴をクリアしました";
-      } else {
-        $("clearedNotice").textContent = `エラー: ${res?.error ?? "不明"}`;
-      }
-      setTimeout(() => { ($("clearedNotice") as HTMLElement).textContent = ""; }, 3000);
-    } finally {
-      btn.disabled = false;
-    }
-  });
 }
 
 init();
