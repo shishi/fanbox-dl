@@ -1,0 +1,1379 @@
+=== commits ===
+86ac122 refactor: remove dedup/history machinery, make downloads fire-and-forget
+
+=== diff (backend) ===
+diff --git a/src/background/orchestrator.ts b/src/background/orchestrator.ts
+index 0b69525..9560fd3 100644
+--- a/src/background/orchestrator.ts
++++ b/src/background/orchestrator.ts
+@@ -1,273 +1,101 @@
+-import { CONFLICT_ACTION } from "../core/settings";
++import { validatePostInfo } from "../fanbox/api";
++import { parsePost, emptyPostNotice } from "../fanbox/parse";
+ import { renderTemplate, TemplateError } from "../core/template-engine";
+ import { validatePath } from "../core/path-validator";
+ import { validateMediaUrl } from "../core/url-allowlist";
+-import { parsePost, emptyPostNotice } from "../fanbox/parse";
+-import { validatePostInfo } from "../fanbox/api";
+-import { buildRenderContext, neutralizePathSeparators } from "./render-adapter";
+-import { classifyDownloadError } from "./failure-classifier";
+-import { findAdoptable } from "./adoption";
+-import {
+-  applyEnqueue, applyDownloadStarted, applyDownloadRequestFailed, applyDownloadComplete,
+-  applyDownloadInterrupted, applyNeedsPageRecovery, applyPruneSweep,
+-  findLeasesWithoutDownloadId, applyReissueLease, applyInvalidateByIds,
+-  type EnqueueCandidate, type JobRecord, type Ledger,
+-} from "./ledger";
+-import { JobStore, StorageWriteError } from "./job-store";
+-import { settleInFlight } from "./settle";
++import { CONFLICT_ACTION } from "../core/settings";
++import { buildRenderContext } from "./render-adapter";
+ import { zipEligible, collectZipSources, buildZip, downloadZipViaOffscreen, ZIP_FALLBACK_WORDING, ZIP_RETRY_WORDING } from "./zip";
+ import type { DownloadRequestMessage, DownloadResponse } from "../content/messages";
+ import type { Settings } from "../core/types";
+ 
++// spec §変更 A: post.info fetch は content script。SW は受領 json を検証して
++// fire-and-forget で DL する。dedup/履歴/resume は持たない。
++// リダイレクト検出だけ downloadId→postId の揮発 Map + onChanged で軽量維持(fail-closed)。
++const REDIRECT_MAP_KEY = "redirectMap";
++
+ export interface OrchestratorDeps {
+-  store: JobStore;
+   downloads: {
+     download(opts: chrome.downloads.DownloadOptions): Promise<number>;
+     search(q: chrome.downloads.DownloadQuery): Promise<chrome.downloads.DownloadItem[]>;
+-    cancel(id: number): Promise<void>;
++    erase(q: chrome.downloads.DownloadQuery): Promise<number[]>;
++    removeFile(id: number): Promise<void>;
+   };
+   loadSettings: () => Promise<Settings>;
+-  // 注: post.info fetch は content script が担うため fetchPost dep は無い(spec §4a)。
+-  //     handleDownloadRequest は message で渡された json を検証して使う。
+   zip: {
+     eligible: typeof zipEligible;
+     collect: typeof collectZipSources;
+     build: typeof buildZip;
+     downloadViaOffscreen: typeof downloadZipViaOffscreen;
+   };
+   now: () => number;
+-  newLeaseToken: () => string;
++  session: {
++    get(key: string): Promise<any>;
++    set(items: Record<string, unknown>): Promise<void>;
++  };
++  log: (msg: string) => void;
+ }
+ 
+-export function createOrchestrator(deps: OrchestratorDeps): {
+-  handleDownloadRequest(msg: DownloadRequestMessage): Promise<DownloadResponse>;
+-  handleDownloadChanged(delta: chrome.downloads.DownloadDelta): Promise<void>;
+-  runStartupReconcile(): Promise<void>;
+-} {
+-  const { store, newLeaseToken } = deps;
+-  // force の lease 解決待ち用: leaseToken -> 進行中の download() 呼び出し(spec §7c-3(a))
+-  const inFlightDownloads = new Map<string, Promise<void>>();
++export function createOrchestrator(deps: OrchestratorDeps) {
++  // downloadId -> postId(リダイレクト再検証用の揮発データ。dedup には使わない)
++  const redirect = new Map<number, string>();
++
++  async function persistRedirect(): Promise<void> {
++    await deps.session.set({ [REDIRECT_MAP_KEY]: Object.fromEntries(redirect) });
++  }
++  async function loadRedirectMap(): Promise<void> {
++    const r = await deps.session.get(REDIRECT_MAP_KEY);
++    const obj = (r?.[REDIRECT_MAP_KEY] as Record<string, string>) ?? {};
++    for (const [id, postId] of Object.entries(obj)) redirect.set(Number(id), postId);
++  }
+ 
+   const mkValidatePath = (s: Settings) => (relPath: string): string | null => {
+     const v = validatePath(relPath, { fullPathMaxLen: s.fullPathMaxLen, uniquifyHeadroom: s.uniquifyHeadroom, conflictAction: CONFLICT_ACTION, segmentMaxLen: s.segmentMaxLen });
+     return v.ok ? null : v.error;
+   };
+ 
+-  // spec §4a-3(緩和): complete 到達時は必ず最終 URL を allowlist で再検証する(redirect 対策)。
+-  // handleDownloadChanged の実 DL complete 経路と、runStartupReconcile の 2 つの complete
+-  // 経路(crash-window adoption / requested reconcile)は、どれも同じ純粋変換をここに集約する。
+-  // 最終レビュー修正2 Fix A: item が undefined、または finalUrl を確定できない場合は
+-  // rec.url へフォールバックしない(フォールバックすると常に allowlist を通ってしまい、
+-  // 「確認できていないのに done」を許してしまう) — fail-closed で error 化する。
+-  function finalizeComplete(
+-    l: Ledger, rec: JobRecord, token: string,
+-    item: { finalUrl?: string; url?: string; filename?: string } | undefined,
+-    now: number,
+-  ): Ledger {
+-    const finalUrl = item?.finalUrl ?? item?.url;
+-    if (!finalUrl) {
+-      return applyDownloadInterrupted(l, rec.idemKey, token, "terminal_error", "完了を確認できませんでした(finalUrl 未確認)", newLeaseToken, now);
+-    }
+-    if (!validateMediaUrl(finalUrl, rec.postId).ok) {
+-      return applyDownloadInterrupted(l, rec.idemKey, token, "terminal_error", "ダウンロードが許可外 URL にリダイレクトされました", newLeaseToken, now);
+-    }
+-    return applyDownloadComplete(l, rec.idemKey, token, item?.filename ?? "", now);
+-  }
+-
+-  // download() はキューの外で呼ぶ(spec §7c-2 デッドロック防止)。結果反映は短いキュー項目。
+-  function startDownload(rec: JobRecord): Promise<void> {
+-    const token = rec.leaseToken!;
+-    const p = (async () => {
+-      // spec §4a: allowlist はあらゆるネットワーク使用の直前に必ず通す。
+-      // retry / resume / reissue は永続化済み URL を使うため、ここでの再検証が最後の砦。
+-      const v = validateMediaUrl(rec.url, rec.postId);
+-      if (!v.ok) {
+-        await store.commit((l) => ({ ledger: applyDownloadRequestFailed(l, rec.idemKey, token, `allowlist 違反: ${v.error}`, deps.now()), result: null }));
+-        inFlightDownloads.delete(token);
+-        return;
+-      }
+-      try {
+-        const downloadId = await deps.downloads.download({
+-          url: rec.url, filename: rec.relPath, saveAs: false, conflictAction: CONFLICT_ACTION,
+-        });
+-        await store.commit((l) => ({ ledger: applyDownloadStarted(l, rec.idemKey, token, downloadId), result: null }));
+-      } catch (e) {
+-        await store.commit((l) => ({ ledger: applyDownloadRequestFailed(l, rec.idemKey, token, String(e)), result: null }));
+-      } finally {
+-        inFlightDownloads.delete(token);
+-      }
+-    })();
+-    inFlightDownloads.set(token, p);
+-    return p;
++  async function startDownload(url: string, filename: string, postId: string): Promise<void> {
++    // spec §4a: download 直前に allowlist 再検証(最後の砦)。
++    const v = validateMediaUrl(url, postId);
++    if (!v.ok) throw new Error(`allowlist 違反: ${v.error}`);
++    const id = await deps.downloads.download({ url, filename, saveAs: false, conflictAction: CONFLICT_ACTION });
++    redirect.set(id, postId);
++    await persistRedirect();
+   }
+ 
+-  // force 前処理は settle.ts(spec §7c-3。ユニットテスト済み)を使う
+-  const settleDeps = {
+-    store, inFlight: inFlightDownloads,
+-    search: (q: { url?: string; id?: number }) => deps.downloads.search(q),
+-    cancel: (id: number) => deps.downloads.cancel(id),
+-    now: deps.now,
+-    sleep: (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+-    newLeaseToken,
+-  };
+-
+   async function handleDownloadRequest(msg: DownloadRequestMessage): Promise<DownloadResponse> {
+     const res: DownloadResponse = { queued: 0, zipQueued: 0, notices: [], errors: [] };
+-    // startDownload() はキューの外の fire-and-forget だが、呼び出し元(content script)へは
+-    // 「requested まで進んだ」状態を返したいので、応答直前にここへ集めて待ち合わせる
+-    // (queue.run 自体はブロックしないため spec §7c-2 デッドロック防止とは独立)。
+-    const pending: Promise<void>[] = [];
+-    const finish = async (): Promise<DownloadResponse> => { await Promise.all(pending); return res; };
+-    if (store.failClosed) {
+-      res.errors.push("ストレージ書き込みに失敗しました。履歴をクリアするまで DL 機能を停止します");
+-      return finish();
+-    }
+ 
+-    // spec §4a: post.info は content script が isolated world で fetch 済み。
+-    // SW は受領 json を検証してから使う(生データを信用しない)。
+     const schemaErr = validatePostInfo(msg.json, msg.postId);
+-    if (schemaErr) { res.errors.push(schemaErr); return finish(); }
+-
++    if (schemaErr) { res.errors.push(schemaErr); return res; }
+     const post = parsePost(msg.json);
+-    if (post.restricted) { res.notices.push("アクセス権がないためダウンロードできません(未加入プランの投稿、または本文を取得できない投稿)"); return finish(); }
+-    // spec §2「対象外・通知のみ」: embed 通知を先に出し、embed だけの投稿は
+-    // 汎用「DL 対象なし」を重ねない(通知のみの扱い)
+-    if (post.skippedEmbeds > 0) {
+-      res.notices.push(`埋め込みコンテンツ ${post.skippedEmbeds} 件は DL 対象外です`);
+-    }
++    if (post.restricted) { res.notices.push("アクセス権がないためダウンロードできません(未加入プランの投稿、または本文を取得できない投稿)"); return res; }
++    if (post.skippedEmbeds > 0) res.notices.push(`埋め込みコンテンツ ${post.skippedEmbeds} 件は DL 対象外です`);
+     if (post.contents.length === 0) {
+       if (post.skippedEmbeds === 0) res.notices.push(emptyPostNotice(post.postType));
+-      return finish();
++      return res;
+     }
+ 
+-    // 最終レビュー修正 P2 round3-2(codex 指摘): options.ts の保存ガード(illegalReplacementError)は
+-    // 新規保存しか防がず、旧バージョンからの引き継ぎや他ブラウザ同期で既に永続化された
+-    // illegalCharReplacement に / や \ が残っている場合、production の render 経路
+-    // (renderTemplate -> sanitizeSegment)がその不正な置換文字列で illegal 文字を置換し、
+-    // adapter(P2)の中和済みの値の中に新しいパス区切りを作ってしまう。
+-    // core(sanitizeSegment)は無改造のまま、実際に使う直前でこの一点だけ中和する。
+-    const loaded = await deps.loadSettings();
+-    const s: Settings = { ...loaded, illegalCharReplacement: neutralizePathSeparators(loaded.illegalCharReplacement) };
++    const s = await deps.loadSettings();
+     const now = new Date(deps.now());
+     const vp = mkValidatePath(s);
+ 
+-    // 前回までの明示エラーをクリック時に可視化する(静かな失敗の禁止。spec §7a)
+-    {
+-      const cur = await store.read();
+-      const prevErrors = Object.values(cur.jobs).filter((j) => j.postId === post.postId && j.state === "error");
+-      if (prevErrors.length > 0) {
+-        res.notices.push(`前回までに ${prevErrors.length} 件が失敗しています: ${prevErrors.slice(0, 3).map((j) => j.error).join(" / ")}`);
+-      }
+-    }
+-
+-    // 全メディア URL の allowlist(spec §4a: あらゆるネットワーク使用の前)
+-    const invalidIds = new Set<string>();
++    // allowlist(spec §4a: あらゆるネットワーク使用の前)
+     for (const b of post.contents) {
+       b.files = b.files.filter((f) => {
+         const v = validateMediaUrl(f.url, post.postId);
+-        if (!v.ok) { res.errors.push(v.error); invalidIds.add(f.stableContentId); }
++        if (!v.ok) res.errors.push(v.error);
+         return v.ok;
+       });
+     }
+ 
+-    // spec §7c-3: force はまず対象投稿の非 terminal ジョブをすべて決着させる
+-    // (needs_page 回復や enqueue で新しい非 terminal を作る前に行う — 順序は normative)
+-    if (msg.force) {
+-      const errs = await settleInFlight(post.postId, settleDeps);
+-      res.errors.push(...errs);
+-      if (errs.length) return finish(); // lease 未解決のままの requeue は禁止(spec §7c-3)
+-    }
+-
+-    // spec §4a: allowlist 違反 ID の既存ジョブ(進行中/needs_page)を error 化し、
+-    // 進行中だったものは実 DL も cancel する
+-    if (invalidIds.size > 0) {
+-      const before = await store.read();
+-      const toCancel = Object.values(before.jobs)
+-        .filter((j) => j.postId === post.postId && invalidIds.has(j.stableContentId) && j.downloadId !== undefined && (j.state === "pending" || j.state === "requested"))
+-        .map((j) => j.downloadId!);
+-      const inv = await store.commit((l) => {
+-        const r = applyInvalidateByIds(l, post.postId, invalidIds, deps.now());
+-        return { ledger: r.ledger, result: r.invalidated };
+-      });
+-      for (const id of toCancel) { try { await deps.downloads.cancel(id); } catch {} }
+-      for (const k of inv) res.errors.push(`${k}: メディア URL が許可外のためダウンロードできません`);
+-    }
+-
+-    // needs_page 回復(spec §6): この投稿の needs_page レコードを安定 ID で再バインド。
+-    // 最終レビュー round5 P2a/P2b(codex 指摘): 回復対象は「現在の設定で実際に個別 DL
+-    // される予定のファイル」に限定する。zip 予定ブロックのファイル(zip 側が扱うため
+-    // 個別回復と二重発生させない)と、無効化された contentType のファイル(勝手な
+-    // 再開を防ぐ)は fresh から除外する。ただし core(applyNeedsPageRecovery)は
+-    // 「fresh に無い stableContentId = 投稿編集で消えた」と解釈して missing/error に
+-    // 倒すため、除外分の既存 needs_page レコードは missing 化される前のスナップショットを
+-    // 保持しておき、commit 後に据え置き(needs_page のまま)へ戻す(core 無改造)。
+-    //
+-    // codex レビュー round5 フォローアップ指摘: zip 予定(zipEligible)は静的な設定判定に
+-    // すぎず、実行時に collect/build/downloadViaOffscreen が失敗して個別 DL に
+-    // フォールバックすることがある。その場合、ここで据え置いた needs_page レコードを
+-    // 後段の個別 candidates ループへそのまま流すと、core の適切な回復ロジック
+-    // (同一 URL は拒否 / URL 変更は世代交代)を経ないまま applyEnqueue の
+-    // 「非回復 needs_page 再クリック」分岐(同世代・無条件再投入)に落ちてしまい、
+-    // 拒否済み URL の黙った再試行や、世代が上がらないままの再投入を招く。
+-    // これを避けるため、zip 予定ブロックの isZipPlanned だけはブロックごとに
+-    // 覚えておき、後段のブロックループで実際に zip が不成立だったブロックに限って
+-    // その場で block スコープの回復(applyNeedsPageRecovery)をもう一度掛け直す。
+-    const zipPlannedByBlock = new Map<typeof post.contents[number], boolean>();
+-    const excludedStableIds = new Set<string>();
+-    const fresh: Array<{ stableContentId: string; url: string; basePath: string }> = [];
+-    for (const b of post.contents) {
+-      const isZipPlanned = deps.zip.eligible(b, s);
+-      zipPlannedByBlock.set(b, isZipPlanned);
+-      for (const f of b.files) {
+-        if (isZipPlanned || !(s.contentTypes as any)[f.contentType]) {
+-          excludedStableIds.add(f.stableContentId);
+-          continue;
+-        }
+-        fresh.push({
+-          stableContentId: f.stableContentId, url: f.url,
+-          basePath: renderTemplate(s.pathTemplate, buildRenderContext(post, b, f, now), { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen }),
+-        });
+-      }
+-    }
+-    try {
+-      const rec = await store.commit((l) => {
+-        // 除外対象 stableContentId を持つ既存 needs_page レコードは、core が missing 化する
+-        // 前の状態をここでスナップショットしておく(復元用)。
+-        const toRestore = Object.values(l.jobs).filter(
+-          (j) => j.postId === post.postId && j.state === "needs_page" && excludedStableIds.has(j.stableContentId),
+-        );
+-        const r = applyNeedsPageRecovery(l, post.postId, fresh, { now: deps.now(), postUpdatedAt: post.updatedAtIso, newLeaseToken, validatePath: vp, invalidIds });
+-        let ledger = r.ledger;
+-        let missing = r.missing;
+-        if (toRestore.length > 0) {
+-          const restoreKeys = new Set(toRestore.map((j) => j.idemKey));
+-          const jobs = { ...ledger.jobs };
+-          for (const orig of toRestore) jobs[orig.idemKey] = orig; // missing 化を取り消し、needs_page に据え置く
+-          ledger = { ...ledger, jobs };
+-          missing = missing.filter((k) => !restoreKeys.has(k));
+-        }
+-        return { ledger, result: { ...r, missing } };
+-      });
+-      for (const j of rec.toStart) { pending.push(startDownload(j)); res.queued++; }
+-      for (const k of rec.missing) res.errors.push(`${k}: 投稿が編集され該当ファイルは存在しません`);
+-      for (const k of rec.refused) res.errors.push(`${k}: 同じ URL のままサーバ側の失敗が続いています。時間を置いて再試行してください`);
+-      for (const k of rec.invalid) res.errors.push(`${k}: メディア URL が許可外のためダウンロードできません`);
+-      res.errors.push(...rec.errors);
+-    } catch (e) {
+-      if (e instanceof StorageWriteError) { res.errors.push(e.message); return finish(); }
+-      throw e;
+-    }
+-
+-    // ブロックごとに zip か個別かを決め、candidates を組み立てる
+-    const candidates: EnqueueCandidate[] = [];
+     for (const b of post.contents) {
+       let zipDone = false;
+-      const isZipPlanned = zipPlannedByBlock.get(b) ?? false;
+-      if (isZipPlanned) {
+-        const collected = await deps.zip.collect(b.files.map((f) => ({ url: f.url, idemKey: f.idemKey, size: f.size })), post.postId, {});
++      if (deps.zip.eligible(b, s)) {
++        const collected = await deps.zip.collect(b.files.map((f) => ({ url: f.url, size: f.size })), post.postId, {});
+         if (collected.ok) {
+           try {
+             const { zipPath, bytes } = deps.zip.build(post, b, collected.buffers, s, now);
+             const pv = vp(zipPath);
+             if (pv) throw new Error(`${zipPath}: ${pv}`);
+             const dl = await deps.zip.downloadViaOffscreen(zipPath, bytes);
+@@ -277,217 +105,48 @@ export function createOrchestrator(deps: OrchestratorDeps): {
+             res.notices.push(`${ZIP_FALLBACK_WORDING}(${ZIP_RETRY_WORDING}): ${e instanceof TemplateError ? e.message : String(e)}`);
+           }
+         } else {
+           res.notices.push(`${ZIP_FALLBACK_WORDING}(${ZIP_RETRY_WORDING}): ${collected.error}`);
+         }
+       }
+-      if (zipDone) continue; // spec §7b: zip 成立ブロックは個別 enqueue しない
+-      if (isZipPlanned) {
+-        // codex レビュー round5 フォローアップ: zip 予定だったが実際には不成立だった
+-        // ブロックに限り、bulk recovery で据え置いた(needs_page のまま残した)
+-        // このブロックの既存レコードへ、ここで初めて正規の回復ロジックを掛け直す
+-        // (同一 URL は拒否 / URL 変更は世代交代)。zip 予定ブロックの files は
+-        // zipEligible の前提上すべて contentType "photo"(かつ有効)なので、
+-        // contentType フィルタは不要。
+-        //
+-        // codex レビュー round5 再指摘その1(P1): applyNeedsPageRecovery は postId 全体の
+-        // needs_page を走査するため、fresh をこのブロックの files だけにすると、
+-        // まだ処理順が回ってきていない他ブロック(他の zip 予定ブロックや
+-        // contentType 無効化分)の据え置き中レコードまで missing 化されてしまう。
+-        // phase 1 と同じ「復元スナップショット」パターンで、このブロック以外の
+-        // needs_page はここでは触らない(missing 化を都度取り消す)。
+-        //
+-        // codex レビュー round5 再指摘その2(P2): basePath の renderTemplate 呼び出しは
+-        // 後段の候補ループと同じく TemplateError を捕捉し、後段と同じ
+-        // 「テンプレートエラー」応答 + finish() に倒す(素通しで throw させない)。
+-        let blockFresh: Array<{ stableContentId: string; url: string; basePath: string }>;
+-        try {
+-          blockFresh = b.files.map((f) => ({
+-            stableContentId: f.stableContentId, url: f.url,
+-            basePath: renderTemplate(s.pathTemplate, buildRenderContext(post, b, f, now), { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen }),
+-          }));
+-        } catch (e) {
+-          res.errors.push(e instanceof TemplateError ? `テンプレートエラー: ${e.message}` : String(e));
+-          return finish();
+-        }
+-        const blockIds = new Set(blockFresh.map((f) => f.stableContentId));
+-        try {
+-          const rec2 = await store.commit((l) => {
+-            const toRestore2 = Object.values(l.jobs).filter(
+-              (j) => j.postId === post.postId && j.state === "needs_page" && !blockIds.has(j.stableContentId),
+-            );
+-            const r = applyNeedsPageRecovery(l, post.postId, blockFresh, { now: deps.now(), postUpdatedAt: post.updatedAtIso, newLeaseToken, validatePath: vp, invalidIds });
+-            let ledger = r.ledger;
+-            let missing = r.missing;
+-            if (toRestore2.length > 0) {
+-              const restoreKeys = new Set(toRestore2.map((j) => j.idemKey));
+-              const jobs = { ...ledger.jobs };
+-              for (const orig of toRestore2) jobs[orig.idemKey] = orig; // 他ブロック分の missing 化を取り消す
+-              ledger = { ...ledger, jobs };
+-              missing = missing.filter((k) => !restoreKeys.has(k));
+-            }
+-            return { ledger, result: { ...r, missing } };
+-          });
+-          for (const j of rec2.toStart) { pending.push(startDownload(j)); res.queued++; }
+-          for (const k of rec2.missing) res.errors.push(`${k}: 投稿が編集され該当ファイルは存在しません`);
+-          for (const k of rec2.refused) res.errors.push(`${k}: 同じ URL のままサーバ側の失敗が続いています。時間を置いて再試行してください`);
+-          for (const k of rec2.invalid) res.errors.push(`${k}: メディア URL が許可外のためダウンロードできません`);
+-          res.errors.push(...rec2.errors);
+-        } catch (e) {
+-          if (e instanceof StorageWriteError) { res.errors.push(e.message); return finish(); }
+-          throw e;
+-        }
+-      }
++      if (zipDone) continue;
+       for (const f of b.files) {
+         if (!(s.contentTypes as any)[f.contentType]) continue;
+-        let basePath: string;
++        let relPath: string;
+         try {
+-          basePath = renderTemplate(s.pathTemplate, buildRenderContext(post, b, f, now), { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen });
++          relPath = renderTemplate(s.pathTemplate, buildRenderContext(post, b, f, now), { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen });
+         } catch (e) {
+           res.errors.push(e instanceof TemplateError ? `テンプレートエラー: ${e.message}` : String(e));
+-          return finish(); // テンプレ不正は全体中断(fantia-dl と同じ契約)
++          return res; // テンプレ不正は全体中断
+         }
+-        candidates.push({
+-          idemKey: f.idemKey, postId: post.postId, stableContentId: f.stableContentId,
+-          contentType: f.contentType, url: f.url, basePath, refetch: f.refetch,
+-        });
++        const pv = vp(relPath);
++        if (pv) { res.errors.push(`${relPath}: ${pv}`); continue; }
++        try { await startDownload(f.url, relPath, post.postId); res.queued++; }
++        catch (e) { res.errors.push(String(e)); }
+       }
+     }
+-
+-    try {
+-      const r = await store.commit((l) => {
+-        const out = applyEnqueue(l, candidates, {
+-          force: msg.force, postUpdatedAt: post.updatedAtIso, now: deps.now(),
+-          newLeaseToken, validatePath: vp,
+-        });
+-        return { ledger: out.ledger, result: out };
+-      });
+-      res.errors.push(...r.errors);
+-      for (const k of r.inFlightBlocked) res.notices.push(`${k}: 進行中のダウンロードがあります。作り直すには再DLボタンを`);
+-      for (const k of r.staleWarnings) res.notices.push(`${k}: 投稿は更新されていますが、このファイルの URL は変わっていません。差し替えを確実に取り込むには 🔄(再DL)を使ってください`);
+-      for (const j of r.toStart) { pending.push(startDownload(j)); res.queued++; }
+-    } catch (e) {
+-      if (e instanceof StorageWriteError) { res.errors.push(e.message); return finish(); }
+-      throw e;
+-    }
+-    return finish();
++    return res;
+   }
+ 
+   async function handleDownloadChanged(delta: chrome.downloads.DownloadDelta): Promise<void> {
+-    if (!delta.state) return;
++    if (!delta.state || delta.id === undefined) return;
+     const cur = delta.state.current;
+     if (cur !== "complete" && cur !== "interrupted") return;
++    const postId = redirect.get(delta.id);
++    if (postId === undefined) return; // 自分の通常 DL ではない(zip は SW 側で先に処理)
++    redirect.delete(delta.id);
++    await persistRedirect();
++    if (cur === "interrupted") return; // 失敗は fire-and-forget(検証不要)
+ 
+-    const ledger = await store.read();
+-    const rec = Object.values(ledger.jobs).find((j) => j.downloadId === delta.id);
+-    if (!rec || !rec.leaseToken) return;
+-    const token = rec.leaseToken;
+-
+-    if (cur === "complete") {
+-      // spec §7c-2: 実保存パスを取得して乖離を判定
+-      const [item] = await deps.downloads.search({ id: delta.id });
+-      // spec §4a-3(緩和): 最終 URL が allowlist を抜けていたら done にせず error 化(redirect 対策)。
+-      // item が undefined(履歴クリア等のレース)の場合も finalizeComplete が fail-closed に倒す。
+-      await store.commit((l) => ({ ledger: finalizeComplete(l, rec, token, item, deps.now()), result: null }));
+-      return;
+-    }
++    // spec §変更 A / §4a-3: 完了時に finalUrl を allowlist 再検証、fail-closed。
+     const [item] = await deps.downloads.search({ id: delta.id });
+-    // classify と ledger 記録は同一の解決済み reason を使う(SERVER_FORBIDDEN の明示文言と
+-    // refusedUrl 刻印が、reason の取得元の違いで欠けないように)
+-    const reason = delta.error?.current ?? item?.error ?? "interrupted";
+-    const action = classifyDownloadError(reason === "interrupted" ? undefined : reason);
+-    const after = await store.commit((l) => {
+-      const l2 = applyDownloadInterrupted(l, rec.idemKey, token, action, reason, newLeaseToken, deps.now());
+-      return { ledger: l2, result: l2.jobs[rec.idemKey] };
+-    });
+-    if (after && after.state === "pending") void startDownload(after); // NETWORK_ の有界リトライ
+-  }
+-
+-  async function runStartupReconcile(): Promise<void> {
+-    // spec §7c-2 フェイルクローズの再起動耐性: failClosed はメモリフラグなので、
+-    // 起動のたびに「現 ledger をそのまま書き戻す」プローブ commit で書き込み可否を再検出する。
+-    // 失敗したら failClosed が立ち(JobStore.commit 内)、resume を含む DL 機能を停止する。
+-    try {
+-      await store.commit((l) => ({ ledger: l, result: null }));
+-    } catch {
+-      console.error("[fanbox-dl] storage write probe failed — DL 機能を停止します(履歴クリアで復旧)");
+-      return; // reconcile も行わない(帳簿を進められないため)
++    // fail-closed(spec §変更 A): finalUrl が無いとき url(要求 URL)で代用しない。
++    const finalUrl = (item as any)?.finalUrl as string | undefined;
++    if (!item || !finalUrl || !validateMediaUrl(finalUrl, postId).ok) {
++      try { await deps.downloads.removeFile(delta.id); } catch {}
++      try { await deps.downloads.erase({ id: delta.id }); } catch {}
++      deps.log(`[fanbox-dl] 許可外 URL へリダイレクトされた可能性があるためダウンロードを破棄しました(postId ${postId})`); // spec §変更 A: click 応答返却後のため console が通知チャネル(zip と同じ制約)
+     }
+-    const ledger = await store.read();
+-
+-    // lease 済み・downloadId 未永続(crash window): adoption 述語で引き取り、ダメなら再投入
+-    for (const rec of findLeasesWithoutDownloadId(ledger)) {
+-      const items = await deps.downloads.search({ url: rec.url });
+-      const hit = findAdoptable(
+-        items.map((d) => ({ id: d.id, url: d.url ?? "", filename: d.filename, startTime: d.startTime ?? "", state: d.state, error: d.error })),
+-        { url: rec.url, relPath: rec.relPath, leasedAt: rec.leasedAt ?? 0 },
+-      );
+-      if (hit) {
+-        await store.commit((l) => ({ ledger: applyDownloadStarted(l, rec.idemKey, rec.leaseToken!, hit.id), result: null }));
+-        if (hit.state === "complete") {
+-          // spec §4a-3(緩和): ここも handleDownloadChanged と同じ finalUrl 再検証を通す
+-          // (採用述語は URL/パス/時刻だけで adopt するため、redirect 済みかどうかは未確認)。
+-          // 最終レビュー修正2 Fix A: 実体再取得(id 指定)が空でも finalizeComplete 自体が
+-          // fail-closed に倒すため、ここで特別扱いせず同じヘルパへ一様に通す
+-          // (すべての完了経路で同一の再検証・同一のフォールバック文言にする)。
+-          const [d] = await deps.downloads.search({ id: hit.id });
+-          await store.commit((l) => ({ ledger: finalizeComplete(l, rec, rec.leaseToken!, d, deps.now()), result: null }));
+-        } else if (hit.state === "interrupted") {
+-          // 採用した実体が既に interrupted の場合、ここで分類まで済ませないと
+-          // 「requested のまま enqueue をブロックし続ける」wedge になる
+-          const [d] = await deps.downloads.search({ id: hit.id });
+-          // 最終レビュー修正2 Fix C: 2 回目(id 指定)の search が history clear 等のレースで
+-          // 空を返しても、採用元 hit(1 回目の url 指定 search)が保持する error
+-          // (SERVER_FORBIDDEN 等)を "interrupted" に丸めて喪失させない。
+-          const reason = d?.error ?? hit.error ?? "interrupted";
+-          const action = classifyDownloadError(reason === "interrupted" ? undefined : reason);
+-          const after = await store.commit((l) => {
+-            const l2 = applyDownloadInterrupted(l, rec.idemKey, rec.leaseToken!, action, reason, newLeaseToken, deps.now());
+-            return { ledger: l2, result: l2.jobs[rec.idemKey] };
+-          });
+-          if (after && after.state === "pending") void startDownload(after);
+-        }
+-        // in_progress は onChanged の terminal 到達に任せる
+-      } else {
+-        // spec §7c-2: requeue は lease を再発行してから(旧 lease の遅延解決を CAS で殺すため)
+-        const reissued = await store.commit((l) => {
+-          const r = applyReissueLease(l, rec.idemKey, rec.leaseToken!, newLeaseToken(), deps.now());
+-          return { ledger: r.ledger, result: r.record };
+-        });
+-        if (reissued) void startDownload(reissued); // 最悪ケースは uniquify の重複 1 個(spec §7c-1)
+-      }
+-    }
+-
+-    // requested: downloadId の実状態と突き合わせ
+-    // (crash-window ループが ledger を進めた可能性があるため必ず再読込する — stale snapshot 禁止)
+-    const ledger2 = await store.read();
+-    for (const rec of Object.values(ledger2.jobs)) {
+-      if (rec.state !== "requested" || rec.downloadId === undefined || !rec.leaseToken) continue;
+-      const [d] = await deps.downloads.search({ id: rec.downloadId });
+-      if (!d) {
+-        const reissued = await store.commit((l) => {
+-          const r = applyReissueLease(l, rec.idemKey, rec.leaseToken!, newLeaseToken(), deps.now());
+-          return { ledger: r.ledger, result: r.record };
+-        });
+-        if (reissued) void startDownload(reissued);
+-        continue;
+-      }
+-      if (d.state === "complete") {
+-        // spec §4a-3(緩和): 再検証は d(検索結果の実 DownloadItem)の finalUrl でそのまま行える
+-        await store.commit((l) => ({ ledger: finalizeComplete(l, rec, rec.leaseToken!, d, deps.now()), result: null }));
+-      } else if (d.state === "interrupted") {
+-        const reason = d.error ?? "interrupted";
+-        const action = classifyDownloadError(reason === "interrupted" ? undefined : reason);
+-        const after = await store.commit((l) => {
+-          const l2 = applyDownloadInterrupted(l, rec.idemKey, rec.leaseToken!, action, reason, newLeaseToken, deps.now());
+-          return { ledger: l2, result: l2.jobs[rec.idemKey] };
+-        });
+-        if (after && after.state === "pending") void startDownload(after);
+-      }
+-    }
+-
+-    // prune / sweep(spec §7c-2)
+-    await store.commit((l) => ({ ledger: applyPruneSweep(l, deps.now()), result: null }));
+   }
+ 
+-  return { handleDownloadRequest, handleDownloadChanged, runStartupReconcile };
++  return { handleDownloadRequest, handleDownloadChanged, loadRedirectMap };
+ }
+diff --git a/src/background/service-worker.ts b/src/background/service-worker.ts
+index 436e6ae..b83e046 100644
+--- a/src/background/service-worker.ts
++++ b/src/background/service-worker.ts
+@@ -1,54 +1,43 @@
+-// service-worker.ts: 薄い束縛のみ。SW ロジック本体は orchestrator.ts(deps 注入ファクトリ)。
++// service-worker.ts: 薄い束縛のみ。SW ロジック本体は orchestrator.ts。
+ import { loadSettings } from "../core/settings";
+-import { applyClearTerminal } from "./ledger";
+-import { JobStore } from "./job-store";
+ import { createOrchestrator } from "./orchestrator";
+ import { zipEligible, collectZipSources, buildZip, downloadZipViaOffscreen, handleZipDownloadChange, reconcileZipDownloads } from "./zip";
+ import type { DownloadRequestMessage, DownloadResponse } from "../content/messages";
+ 
+-const store = new JobStore();
+-
+ const orchestrator = createOrchestrator({
+-  store,
+   downloads: {
+     download: (opts) => chrome.downloads.download(opts),
+     search: (q) => chrome.downloads.search(q),
+-    cancel: (id) => chrome.downloads.cancel(id),
++    erase: (q) => chrome.downloads.erase(q),
++    removeFile: (id) => chrome.downloads.removeFile(id),
+   },
+   loadSettings,
+-  zip: {
+-    eligible: zipEligible,
+-    collect: collectZipSources,
+-    build: buildZip,
+-    downloadViaOffscreen: downloadZipViaOffscreen,
+-  },
++  zip: { eligible: zipEligible, collect: collectZipSources, build: buildZip, downloadViaOffscreen: downloadZipViaOffscreen },
+   now: () => Date.now(),
+-  newLeaseToken: () => crypto.randomUUID(),
++  session: {
++    get: (k) => chrome.storage.session.get(k),
++    set: (items) => chrome.storage.session.set(items),
++  },
++  log: (m) => console.error(m),
+ });
+ 
+ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+   if (msg?.kind === "download") {
+     orchestrator.handleDownloadRequest(msg as DownloadRequestMessage)
+       .then(sendResponse)
+       .catch((e) => sendResponse({ queued: 0, zipQueued: 0, notices: [], errors: [String(e)] } satisfies DownloadResponse));
+     return true;
+   }
+-  if (msg?.kind === "clearHistory") {
+-    store.commit((l) => ({ ledger: applyClearTerminal(l, Date.now()), result: null }))
+-      .then(() => { store.failClosed = false; sendResponse({ ok: true }); })
+-      .catch((e) => sendResponse({ ok: false, error: String(e) }));
+-    return true;
+-  }
+   return false;
+ });
+ 
+ chrome.downloads.onChanged.addListener(async (delta) => {
+-  if (await handleZipDownloadChange(delta)) return; // zip 由来(job-store 対象外)
++  if (await handleZipDownloadChange(delta)) return; // zip 由来
+   await orchestrator.handleDownloadChanged(delta);
+ });
+ 
+-// 起動時 reconcile(spec §7c-1 / fantia-dl 同等)
++// 起動時: zip blob URL の revoke 用復元 + redirect map 復元(通常 DL の resume は無い)
+ (async () => {
+   await reconcileZipDownloads();
+-  await orchestrator.runStartupReconcile();
+-})().catch((e) => console.error("[fanbox-dl] reconcile failed:", e));
++  await orchestrator.loadRedirectMap();
++})().catch((e) => console.error("[fanbox-dl] startup failed:", e));
+diff --git a/src/background/zip.ts b/src/background/zip.ts
+index 8df1e6a..c6731ba 100644
+--- a/src/background/zip.ts
++++ b/src/background/zip.ts
+@@ -47,13 +47,13 @@ function realBinFetch(url: string, init?: RequestInit): Promise<ChunkedResponse>
+       abort: () => { void reader?.cancel().catch(() => {}); },
+     };
+   });
+ }
+ 
+ export async function collectZipSources(
+-  files: Array<{ url: string; idemKey: string; size?: number }>, postId: string,
++  files: Array<{ url: string; size?: number }>, postId: string,
+   deps: { fetchFn?: BinFetch; budget?: number } = {},
+ ): Promise<{ ok: true; buffers: Map<string, Uint8Array> } | { ok: false; error: string }> {
+   const fetchFn = deps.fetchFn ?? realBinFetch;
+   const budget = deps.budget ?? ZIP_SOURCE_BUDGET_BYTES;
+   if (files.length > ZIP_MAX_FILES) return { ok: false, error: `zip 件数上限(${ZIP_MAX_FILES})超過` };
+   // spec §7b(a): サイズ既知の item の合計での事前チェック(1 バイトも fetch せずに拒否)
+@@ -82,27 +82,27 @@ export async function collectZipSources(
+       parts.push(chunk);
+     }
+     if (over) return { ok: false, error: `zip ソース合計がバイト上限(${budget})を超過したため中止` };
+     const buf = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
+     let off = 0;
+     for (const p of parts) { buf.set(p, off); off += p.byteLength; }
+-    buffers.set(f.idemKey, buf);
++    buffers.set(f.url, buf);
+   }
+   return { ok: true, buffers };
+ }
+ 
+ export function buildZip(
+   post: PostData, block: ContentBlock, buffers: Map<string, Uint8Array>, s: Settings, now: Date,
+ ): { zipPath: string; bytes: Uint8Array } {
+   const entries: Record<string, Uint8Array> = {};
+   const usedNames = new Set<string>();
+   for (const f of block.files) {
+-    const buf = buffers.get(f.idemKey);
++    const buf = buffers.get(f.url);
+     // spec §7b: 黙った欠落の禁止。ソースが揃っていない zip は組み立てず error にして
+     // 呼び出し側の個別 DL フォールバックに乗せる。
+-    if (!buf) throw new Error(`zip ソース欠落: ${f.idemKey}`);
++    if (!buf) throw new Error(`zip ソース欠落: ${f.url}`);
+     const ctx = buildRenderContext(post, block, f, now);
+     let entryPath = renderTemplate(s.zipEntryTemplate, ctx, { replacement: s.illegalCharReplacement, segmentMaxLen: s.segmentMaxLen });
+     // テンプレが $seq を含まない等の衝突 -> 静かな上書きを防ぐため連番(fantia-dl と同一規則)
+     if (usedNames.has(entryPath)) {
+       const dot = entryPath.lastIndexOf(".");
+       const stem = dot > 0 ? entryPath.slice(0, dot) : entryPath;
+diff --git a/src/content/messages.ts b/src/content/messages.ts
+index 4dc5ab9..e979092 100644
+--- a/src/content/messages.ts
++++ b/src/content/messages.ts
+@@ -1,25 +1,19 @@
+-// content script -> SW のメッセージ。parse/render/zip/検証 は SW 側(spec §3)。
+-// ただし post.info の fetch だけは content script(isolated world)が行い(§4a)、
++// content script -> SW のメッセージ。post.info の fetch は content script(isolated world)が行い(spec §4a)、
+ // その json を渡す。SW は受領 json を検証してから使う。
+ export interface DownloadRequestMessage {
+   kind: "download";
+   postId: string;
+-  force: boolean;
+-  json: unknown; // content script が isolated world で fetch した post.info 応答
++  json: unknown;
+ }
+ 
+ export interface DownloadResponse {
+   queued: number;
+   zipQueued: number;
+-  notices: string[]; // 非致命の通知(updatedDatetime 警告・zip フォールバック等)
+-  errors: string[];  // 明示エラー
++  notices: string[];
++  errors: string[];
+ }
+ 
+-export interface ClearHistoryMessage {
+-  kind: "clearHistory";
+-}
+-
+-// /posts/{id}(サブドメイン形式)と /@{slug}/posts/{id}(www 形式)の両対応(spec §12)
++// /posts/{id}(サブドメイン形式)と /@{slug}/posts/{id}(www 形式)の両対応
+ export function postIdFromPathname(pathname: string): string | null {
+   return pathname.match(/\/posts\/(\d+)(?:$|\/)/)?.[1] ?? null;
+ }
+diff --git a/src/core/types.ts b/src/core/types.ts
+index e4ac1a6..e7329fc 100644
+--- a/src/core/types.ts
++++ b/src/core/types.ts
+@@ -1,39 +1,32 @@
+ // src/core/types.ts
+ export type ContentType = "photo" | "file" | "video";
+ 
+-// identity(stableContentId)とテンプレ用ブロック番号(blockOrdinal)は
+-// 型レベルで分離する(spec §6 構造的分離)。どちらも string/number だが、
+-// contentId という名前は render adapter の出力(RenderContext)にしか現れない。
+ export interface FileItem {
+   contentType: ContentType;
+-  url: string;               // downloads.fanbox.cc の直 URL(署名なし・期限なし)
+-  filename: string | null;   // file: name(人間可読・拡張子なし) / image: URL basename(ハッシュ)
+-  ext: string;               // 拡張子(ドットなし)。API の extension を正とする
+-  size?: number;             // file item のみ API が返す(zip 事前サイズチェック用 spec §7b)
+-  seq: number;               // ブロック内 1-based(重複スキップ後の連番)
++  url: string;               // downloads.fanbox.cc の直 URL(zip の buffers キーにも使う=post 内で一意)
++  filename: string | null;   // file: name(拡張子なし) / image: URL basename(ハッシュ)
++  ext: string;               // 拡張子(ドットなし)
++  size?: number;             // file item のみ(zip 事前サイズチェック用)
++  seq: number;               // ブロック内 1-based(重複スキップ後)
+   total: number;             // ブロック内総数(重複スキップ後)
+-  idemKey: string;           // "postId:stableContentId"
+-  stableContentId: string;   // "image:{id}" | "file:{id}"(imageMap/fileMap は別名前空間)
+-  refetch: { postId: string; stableContentId: string; index: number };
+ }
+ 
+ export interface ContentBlock {
+-  blockOrdinal: number;      // post 内 1-based 通し番号($contentId の値になる。識別子ではない)
++  blockOrdinal: number;      // post 内 1-based 通し番号($contentId の値。識別子ではない)
+   contentType: ContentType;
+   files: FileItem[];
+ }
+ 
+ export interface PostData {
+   postId: string;
+   postTitle: string;
+   creator: string;           // user.name
+   creatorId: string;         // creatorId(人間可読スラグ)
+   fee: number;               // feeRequired($plan は String(fee))
+   publishedAt: Date;         // publishedDatetime
+-  updatedAtIso: string;      // updatedDatetime(鮮度シグナル。spec §8)
+   restricted: boolean;       // isRestricted / body:null
+   postType: string;          // "image" | "file" | "article" | "text" | 未知
+   skippedEmbeds: number;     // embed/url_embed/未知メディアブロックの件数(spec §2: 対象外・通知のみ)
+   contents: ContentBlock[];
+ }
+ 
+diff --git a/src/fanbox/parse.ts b/src/fanbox/parse.ts
+index 8eea130..9fed353 100644
+--- a/src/fanbox/parse.ts
++++ b/src/fanbox/parse.ts
+@@ -1,7 +1,7 @@
+-import type { PostData, ContentBlock, FileItem } from "../core/types";
++import type { PostData, FileItem } from "../core/types";
+ 
+ const VIDEO_EXT = new Set(["mp4", "mov", "m4v", "webm", "avi", "mkv"]);
+ 
+ function urlBasenameNoExt(url: string): string {
+   const path = url.split("?")[0];
+   const base = path.substring(path.lastIndexOf("/") + 1);
+@@ -15,27 +15,23 @@ interface RawFile { id: string; name: string; extension: string; url: string; si
+ function imageToItem(im: RawImage): Omit<FileItem, "seq" | "total"> {
+   return {
+     contentType: "photo",
+     url: im.originalUrl,
+     filename: urlBasenameNoExt(im.originalUrl),
+     ext: (im.extension || "").toLowerCase(),
+-    idemKey: "", stableContentId: `image:${im.id}`,
+-    refetch: { postId: "", stableContentId: `image:${im.id}`, index: 0 },
+   };
+ }
+ 
+ function fileToItem(f: RawFile): Omit<FileItem, "seq" | "total"> {
+   const ext = (f.extension || "").toLowerCase();
+   return {
+     contentType: VIDEO_EXT.has(ext) ? "video" : "file",
+     url: f.url,
+     filename: f.name ?? null,
+     ext,
+     size: typeof f.size === "number" ? f.size : undefined,
+-    idemKey: "", stableContentId: `file:${f.id}`,
+-    refetch: { postId: "", stableContentId: `file:${f.id}`, index: 0 },
+   };
+ }
+ 
+ // spec §2: DL 対象が無い投稿の type 別通知文言(text=対象なし / video=対象外(通知のみ) /
+ // 未知=スキップ+通知)。SW が contents 空のとき使う。
+ const KNOWN_TYPES = new Set(["image", "file", "article", "text", "video"]);
+@@ -54,13 +50,12 @@ export function parsePost(json: any): PostData {
+     postId,
+     postTitle: post.title ?? "",
+     creator: post.user?.name ?? "",
+     creatorId: post.creatorId ?? "",
+     fee: typeof post.feeRequired === "number" ? post.feeRequired : 0,
+     publishedAt: new Date(post.publishedDatetime ?? 0),
+-    updatedAtIso: post.updatedDatetime ?? "",
+     restricted,
+     postType: post.type ?? "",
+     skippedEmbeds: 0,
+     contents: [],
+   };
+   if (restricted) return data;
+@@ -96,25 +91,21 @@ export function parsePost(json: any): PostData {
+       // p / 見出し等の非メディアブロックは無視(グループも切らない)
+     }
+   }
+   // text / video(外部埋め込み) / 未知 type は groups 空のまま
+ 
+   let ordinal = 0;
+-  let parseIndex = 0; // spec §6: refetch.index は投稿全体のパース順(整合性チェック専用)
+   for (const g of groups) {
+     ordinal++;
+     const files: FileItem[] = g.items.map((it, i) => ({
+       ...it,
+       seq: i + 1,
+       total: g.items.length,
+-      idemKey: `${postId}:${it.stableContentId}`,
+-      refetch: { postId, stableContentId: it.stableContentId, index: parseIndex++ },
+     }));
+-    const block: ContentBlock = {
++    data.contents.push({
+       blockOrdinal: ordinal,
+       contentType: g.kind === "image" ? "photo" : "file",
+       files,
+-    };
+-    data.contents.push(block);
++    });
+   }
+   return data;
+ }
+diff --git a/tests/orchestrator.test.ts b/tests/orchestrator.test.ts
+index 55b409c..e1f0a3c 100644
+--- a/tests/orchestrator.test.ts
++++ b/tests/orchestrator.test.ts
+@@ -1,435 +1,118 @@
+ import { describe, it, expect } from "vitest";
+ import { createOrchestrator, type OrchestratorDeps } from "../src/background/orchestrator";
+-import { JobStore } from "../src/background/job-store";
+-import { applyEnqueue } from "../src/background/ledger";
+ import { DEFAULT_SETTINGS } from "../src/core/settings";
+ 
+-const memStorage = () => {
+-  const mem: Record<string, unknown> = {};
+-  return { get: async (k: string) => ({ [k]: mem[k] }), set: async (i: Record<string, unknown>) => { Object.assign(mem, i); } };
+-};
+-const img = (id: string) => ({
+-  id, extension: "jpeg", width: 1, height: 1,
+-  originalUrl: `https://downloads.fanbox.cc/images/post/1/${id}.jpeg`,
+-  thumbnailUrl: `https://downloads.fanbox.cc/images/post/1/t${id}.jpeg`,
+-});
+-const postJson = (images: any[]) => ({ body: { post: {
+-  id: "1", title: "T", feeRequired: 0, publishedDatetime: "2026-07-01T00:00:00+09:00",
+-  updatedDatetime: "2026-07-02T00:00:00+09:00", isRestricted: false,
+-  user: { userId: "9", name: "C" }, creatorId: "s", type: "image",
+-  body: { text: "", images },
+-} } });
++const img = (id: string) => ({ id, extension: "jpeg", width: 1, height: 1, originalUrl: `https://downloads.fanbox.cc/images/post/1/${id}.jpeg`, thumbnailUrl: `https://downloads.fanbox.cc/images/post/1/t${id}.jpeg` });
++const postJson = (images: any[], over: any = {}) => ({ body: { post: { id: "1", title: "T", feeRequired: 0, publishedDatetime: "2026-07-01T00:00:00+09:00", isRestricted: false, user: { userId: "9", name: "C" }, creatorId: "s", type: "image", body: { text: "", images }, ...over } } });
+ 
+-function mkDeps(over: Partial<OrchestratorDeps> = {}): { deps: OrchestratorDeps; downloaded: string[]; store: JobStore } {
+-  const store = new JobStore(memStorage()); // 各テストが ledger を直接検証できるよう露出する
+-  const downloaded: string[] = [];
++function mkDeps(over: Partial<OrchestratorDeps> = {}) {
++  const downloaded: Array<{ url: string; filename: string; conflictAction?: string }> = [];
++  const erased: number[] = []; const removed: number[] = []; const logs: string[] = [];
++  const mem: Record<string, unknown> = {};
+   let nextId = 100;
++  let searchImpl: (q: any) => Promise<any[]> = async () => [];
+   const deps: OrchestratorDeps = {
+-    store,
+     downloads: {
+-      download: async (o) => { downloaded.push(o.url!); return ++nextId; },
+-      search: async () => [],
+-      cancel: async () => {},
++      download: async (o) => { downloaded.push({ url: o.url!, filename: o.filename!, conflictAction: o.conflictAction }); return ++nextId; },
++      search: (q) => searchImpl(q),
++      erase: async (q) => { erased.push((q as any).id); return [(q as any).id]; },
++      removeFile: async (id) => { removed.push(id); },
+     },
+     loadSettings: async () => ({ ...DEFAULT_SETTINGS }),
+-    zip: {
+-      eligible: () => true,
+-      collect: async () => ({ ok: false, error: "fetch 失敗(テスト)" }),
+-      build: () => { throw new Error("unreachable"); },
+-      downloadViaOffscreen: async () => ({ ok: true }),
+-    },
+-    now: () => 1_000,
+-    newLeaseToken: (() => { let n = 0; return () => `T${++n}`; })(),
++    zip: { eligible: () => false, collect: async () => ({ ok: false, error: "x" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) },
++    now: () => 1000,
++    session: { get: async (k) => ({ [k]: mem[k] }), set: async (i) => { Object.assign(mem, i); } },
++    log: (m) => logs.push(m),
+     ...over,
+   };
+-  return { deps, downloaded, store };
++  return { deps, downloaded, erased, removed, logs, setSearch: (f: typeof searchImpl) => { searchImpl = f; } };
+ }
+ 
+-describe("orchestrator (SW 層の spec 契約)", () => {
+-  it("zip 不成立ブロックは自動で個別 DL に enqueue され、必須文言の通知が付く (spec §7b)", async () => {
+-    const { deps, downloaded, store } = mkDeps();
+-    const o = createOrchestrator(deps);
+-    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a"), img("b")]) });
+-    expect(res.zipQueued).toBe(0);
+-    expect(res.queued).toBe(2); // フォールバックで 2 枚とも個別 enqueue
+-    expect(downloaded).toHaveLength(2);
+-    // spec §7b の 2 フレーズを両方含む
+-    expect(res.notices.some((n) => n.includes("zip にできないため個別ダウンロードに切り替えました"))).toBe(true);
+-    expect(res.notices.some((n) => n.includes("zip は最初からやり直し。確実性が要るなら通常 DL を。"))).toBe(true);
+-    // 一発 DL ではなくジョブ永続化ありの通常経路であること(spec §7a: ledger に requested で載る)
+-    const l = await store.read();
+-    const recs = Object.values(l.jobs).filter((j) => j.postId === "1");
+-    expect(recs.map((j) => j.stableContentId).sort()).toEqual(["image:a", "image:b"]);
+-    expect(recs.every((j) => j.state === "requested" && j.downloadId !== undefined)).toBe(true);
+-  });
+-
+-  it("body:null(isRestricted:false)は『アクセス権なし』通知のみで enqueue に到達しない (spec §6)", async () => {
+-    const nullBody = { body: { post: { id: "1", title: "T", feeRequired: 500, publishedDatetime: "2026-07-01T00:00:00+09:00", updatedDatetime: "x", isRestricted: false, user: { userId: "9", name: "C" }, creatorId: "s", type: "image", body: null } } };
++describe("orchestrator fire-and-forget", () => {
++  it("個別 DL: 各ファイルを uniquify で download する", async () => {
+     const { deps, downloaded } = mkDeps();
+     const o = createOrchestrator(deps);
+-    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: nullBody });
+-    expect(res.queued).toBe(0);
+-    expect(res.errors).toEqual([]);
+-    expect(res.notices.some((n) => n.includes("アクセス権"))).toBe(true);
+-    expect(downloaded).toEqual([]);
+-    expect(Object.keys((await deps.store.read()).jobs)).toEqual([]); // enqueue 到達なし
+-  });
+-
+-  it("allowlist 違反 URL は一切 download() されず、明示エラーになる (spec §4a: ネットワーク使用前)", async () => {
+-    const bad = { ...img("evil"), originalUrl: "https://evil.example.com/images/post/1/evil.jpeg" };
+-    const { deps, downloaded } = mkDeps({ zip: { eligible: () => false, collect: async () => ({ ok: false, error: "x" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) } });
+-    const o = createOrchestrator(deps);
+-    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([bad, img("ok")]) });
+-    expect(downloaded).toEqual([img("ok").originalUrl]); // 違反 URL は 1 バイトもネットワークに乗らない
+-    expect(res.errors.some((e) => e.includes("許可外"))).toBe(true);
+-    // spec §4a「ジョブを enqueue せず」: 違反 item の ledger レコードは作られない
+-    const keys = Object.keys((await deps.store.read()).jobs);
+-    expect(keys).toEqual(["1:image:ok"]);
+-  });
+-
+-  it("onChanged: search 側だけが SERVER_FORBIDDEN を持つ interrupted でも必須文言 + refusedUrl が刻まれる (spec §6/§7a)", async () => {
+-    const { deps, downloaded, store } = mkDeps({ zip: { eligible: () => false, collect: async () => ({ ok: false, error: "x" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) } });
+-    const o = createOrchestrator(deps);
+-    await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a"), img("b")]) });
+-    const rec = Object.values((await store.read()).jobs)[0];
+-    deps.downloads.search = async () => [{ id: rec.downloadId!, error: "SERVER_FORBIDDEN", state: "interrupted" } as any];
+-    await o.handleDownloadChanged({ id: rec.downloadId!, state: { current: "interrupted", previous: "in_progress" } } as any);
+-    const after = (await store.read()).jobs[rec.idemKey];
+-    expect(after.state).toBe("error");
+-    expect(after.error).toContain("未加入の有料コンテンツの可能性");
+-    expect(after.refusedUrl).toBe(after.url);
+-    expect(downloaded.length).toBeGreaterThan(0);
+-  });
+-
+-  it("起動時 reconcile: crash-window adoption が complete でも finalUrl が allowlist 外なら done にせず error にする (spec §4a-3 / 最終レビュー修正1)", async () => {
+-    const { deps, store } = mkDeps();
+-    const url = "https://downloads.fanbox.cc/images/post/1/a.jpeg";
+-    const relPath = "fanbox/s/T/a.jpeg";
+-    await store.commit((l) => {
+-      const r = applyEnqueue(l, [{
+-        idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+-        url, basePath: relPath,
+-        refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+-      }], { force: false, postUpdatedAt: "x", now: 1000, newLeaseToken: () => "L1", validatePath: () => null });
+-      return { ledger: r.ledger, result: null };
+-    });
+-    // adoption 検索(url 指定)ではヒットを返し、後段の実体再取得(id 指定)では
+-    // finalUrl が allowlist 外(redirect された想定)を返す。
+-    deps.downloads.search = async (q: any) => {
+-      if (q?.id === 55) return [{ id: 55, url, finalUrl: "https://evil.example.com/a.jpeg", filename: `/dl/${relPath}`, state: "complete" } as any];
+-      return [{ id: 55, url, filename: `/dl/${relPath}`, startTime: new Date(2000).toISOString(), state: "complete" }];
+-    };
+-    const o = createOrchestrator(deps);
+-    await o.runStartupReconcile();
+-    const rec = (await store.read()).jobs["1:image:a"];
+-    expect(rec.state).toBe("error"); // done にしない
+-    expect(rec.error).toContain("許可外");
+-  });
+-
+-  it("起動時 reconcile: requested の実 DL が complete でも finalUrl が allowlist 外なら done にせず error にする (spec §4a-3 / 最終レビュー修正1)", async () => {
+-    const { deps, store } = mkDeps();
+-    const o = createOrchestrator(deps);
+-    await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a")]) });
+-    const rec0 = Object.values((await store.read()).jobs)[0];
+-    deps.downloads.search = async (q: any) => {
+-      if (q?.id === rec0.downloadId) return [{ id: rec0.downloadId, finalUrl: "https://evil.example.com/a.jpeg", filename: "/dl/x", state: "complete" } as any];
+-      return [];
+-    };
+-    await o.runStartupReconcile();
+-    const after = (await store.read()).jobs[rec0.idemKey];
+-    expect(after.state).toBe("error"); // done にしない
+-    expect(after.error).toContain("許可外");
+-  });
+-
+-  it("起動時 reconcile: crash-window adoption 後の実体再取得が空(race)なら finalUrl 未検証のまま done にせず fail-closed で error にする (codex レビュー指摘 P3 round2)", async () => {
+-    const { deps, store } = mkDeps();
+-    const url = "https://downloads.fanbox.cc/images/post/1/a.jpeg";
+-    const relPath = "fanbox/s/T/a.jpeg";
+-    await store.commit((l) => {
+-      const r = applyEnqueue(l, [{
+-        idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+-        url, basePath: relPath,
+-        refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+-      }], { force: false, postUpdatedAt: "x", now: 1000, newLeaseToken: () => "L1", validatePath: () => null });
+-      return { ledger: r.ledger, result: null };
+-    });
+-    // adoption 検索(url 指定)ではヒットを返すが、後段の実体再取得(id 指定)は
+-    // history clear 等のレースで空配列を返す想定。ここで hit.url(常に allowlist 内)を
+-    // 「検証済み finalUrl」として採用すると、redirect bypass を再び許してしまう。
+-    deps.downloads.search = async (q: any) => {
+-      if (q?.id === 55) return [];
+-      return [{ id: 55, url, filename: `/dl/${relPath}`, startTime: new Date(2000).toISOString(), state: "complete" } as any];
+-    };
+-    const o = createOrchestrator(deps);
+-    await o.runStartupReconcile();
+-    const rec = (await store.read()).jobs["1:image:a"];
+-    expect(rec.state).toBe("error"); // 検証できないまま done にしない(fail-closed)
+-  });
+-
+-  it("onChanged: complete だが search({id}) が空(履歴クリア等のレース)なら done にせず error にする(finalUrl 未確認) (最終レビュー修正2 Fix A)", async () => {
+-    const { deps, store } = mkDeps({ zip: { eligible: () => false, collect: async () => ({ ok: false, error: "x" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) } });
+-    const o = createOrchestrator(deps);
+-    await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a")]) });
+-    const rec = Object.values((await store.read()).jobs)[0];
+-    // rec.url にフォールバックすると常に allowlist を通ってしまい「確認できていないのに done」に
+-    // なる — item(finalUrl の出所)が取れない以上、done にせず fail-closed で error 化する。
+-    deps.downloads.search = async () => [];
+-    await o.handleDownloadChanged({ id: rec.downloadId!, state: { current: "complete", previous: "in_progress" } } as any);
+-    const after = (await store.read()).jobs[rec.idemKey];
+-    expect(after.state).toBe("error"); // done にしない
+-    expect(after.error).toContain("finalUrl");
+-  });
+-
+-  it("起動時 reconcile: crash-window adoption した interrupted の hit が error(SERVER_FORBIDDEN) を持つ場合、実体再取得(id 指定)が空でも reason を失わず refusedUrl が付く (最終レビュー修正2 Fix C)", async () => {
+-    const { deps, store } = mkDeps();
+-    const url = "https://downloads.fanbox.cc/images/post/1/a.jpeg";
+-    const relPath = "fanbox/s/T/a.jpeg";
+-    await store.commit((l) => {
+-      const r = applyEnqueue(l, [{
+-        idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+-        url, basePath: relPath,
+-        refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+-      }], { force: false, postUpdatedAt: "x", now: 1000, newLeaseToken: () => "L1", validatePath: () => null });
+-      return { ledger: r.ledger, result: null };
+-    });
+-    // adoption 検索(url 指定)ではヒットが SERVER_FORBIDDEN の error を持つ interrupted を返し、
+-    // 後段の実体再取得(id 指定)は history clear 等のレースで空を返す。
+-    deps.downloads.search = async (q: any) => {
+-      if (q?.id === 55) return [];
+-      return [{ id: 55, url, filename: `/dl/${relPath}`, startTime: new Date(2000).toISOString(), state: "interrupted", error: "SERVER_FORBIDDEN" } as any];
+-    };
+-    const o = createOrchestrator(deps);
+-    await o.runStartupReconcile();
+-    const rec = (await store.read()).jobs["1:image:a"];
+-    expect(rec.state).toBe("error");
+-    // reason が "interrupted" に丸められて SERVER_FORBIDDEN を喪失していないこと
+-    expect(rec.error).toContain("未加入の有料コンテンツの可能性");
+-    expect(rec.refusedUrl).toBe(url);
++    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a"), img("b")]) });
++    expect(res.queued).toBe(2);
++    expect(downloaded).toHaveLength(2);
++    expect(downloaded.every((d) => d.conflictAction === "uniquify")).toBe(true);
+   });
+ 
+-  it("永続化された illegalCharReplacement が / や \\ を含んでいても(旧バージョンからの引き継ぎ・他ブラウザ同期等)、production の render 経路でパス区切りが新生しない (codex レビュー指摘 P2 round3-2: options.ts の保存ガードは新規保存しか防がない)", async () => {
+-    // postTitle に含まれる ":" は core の ILLEGAL 文字集合に入っており、
+-    // sanitizeSegment が illegalCharReplacement で置換する。置換文字列自体が "/" だと、
+-    // (adapter の中和は creator/postTitle 等の値そのものの / \ にしか効かないため)
+-    // 置換後に新しいディレクトリ境界が生まれてしまう。
+-    const jsonWithColon = { body: { post: {
+-      id: "1", title: "A:B", feeRequired: 0, publishedDatetime: "2026-07-01T00:00:00+09:00",
+-      updatedDatetime: "2026-07-02T00:00:00+09:00", isRestricted: false,
+-      user: { userId: "9", name: "C" }, creatorId: "s", type: "image",
+-      body: { text: "", images: [img("a")] },
+-    } } };
+-    const { deps, store } = mkDeps({
+-      loadSettings: async () => ({ ...DEFAULT_SETTINGS, illegalCharReplacement: "/" }),
+-      zip: { eligible: () => false, collect: async () => ({ ok: false, error: "x" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) },
+-    });
++  it("zip フォールバックは 2 フレーズの notice + 個別 DL", async () => {
++    const { deps, downloaded } = mkDeps({ zip: { eligible: () => true, collect: async () => ({ ok: false, error: "boom" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) } });
+     const o = createOrchestrator(deps);
+-    await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: jsonWithColon });
+-    const rec = Object.values((await store.read()).jobs)[0];
+-    const expectedSegments = DEFAULT_SETTINGS.pathTemplate.split("/").length;
+-    expect(rec.relPath.split("/").length).toBe(expectedSegments); // 余計なサブフォルダが増えない
+-    expect(rec.relPath).not.toContain(":"); // 置換自体は行われている
++    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a"), img("b")]) });
++    expect(downloaded).toHaveLength(2);
++    expect(res.notices.some((n) => n.includes("zip にできないため個別ダウンロードに切り替えました"))).toBe(true);
++    expect(res.notices.some((n) => n.includes("zip は最初からやり直し"))).toBe(true);
+   });
+ 
+-  it("zip 予定ギャラリーに needs_page があっても回復は個別 DL を再開せず zip 1 本だけになる(二重発生防止) (最終レビュー round5 P2a)", async () => {
+-    const { deps, downloaded, store } = mkDeps({
+-      zip: {
+-        eligible: () => true,
+-        collect: async () => ({ ok: true, buffers: new Map([
+-          ["1:image:a", new Uint8Array(1)],
+-          ["1:image:b", new Uint8Array(1)],
+-        ]) }),
+-        build: () => ({ zipPath: "fanbox/s/T/T.zip", bytes: new Uint8Array(1) }),
+-        downloadViaOffscreen: async () => ({ ok: true }),
+-      },
+-    });
+-    // 過去に needs_page で止まっていた image:a のジョブを仕込む(今回の投稿には現存する)
+-    await store.commit((l) => ({
+-      ledger: {
+-        ...l,
+-        jobs: {
+-          ...l.jobs,
+-          "1:image:a": {
+-            idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+-            relPath: "fanbox/s/T/old-a.jpeg", url: "https://downloads.fanbox.cc/images/post/1/old-a.jpeg",
+-            generation: 1, state: "needs_page",
+-            refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+-          } as any,
+-        },
+-      },
+-      result: null,
+-    }));
++  it("allowlist 違反 URL は download されず errors", async () => {
++    const bad = { ...img("evil"), originalUrl: "https://evil.example.com/x.jpeg" };
++    const { deps, downloaded } = mkDeps();
+     const o = createOrchestrator(deps);
+-    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a"), img("b")]) });
+-    expect(res.zipQueued).toBe(1);
+-    expect(res.queued).toBe(0); // needs_page 回復から個別 DL が始まらない(zip との二重発生防止)
+-    expect(downloaded).toHaveLength(0); // chrome.downloads.download() は一切呼ばれていない
+-    const after = (await store.read()).jobs["1:image:a"];
+-    expect(after.state).toBe("needs_page"); // 回復対象から除外され、missing/error にもならずそのまま
++    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([bad, img("ok")]) });
++    expect(downloaded.map((d) => d.url)).toEqual([img("ok").originalUrl]);
++    expect(res.errors.length).toBeGreaterThan(0);
+   });
+ 
+-  it("video を無効化した後は video の needs_page が回復再開されない (最終レビュー round5 P2b)", async () => {
+-    const { deps, store } = mkDeps({
+-      loadSettings: async () => ({ ...DEFAULT_SETTINGS, contentTypes: { ...DEFAULT_SETTINGS.contentTypes, video: false } }),
+-      zip: { eligible: () => false, collect: async () => ({ ok: false, error: "x" }), build: () => { throw new Error("x"); }, downloadViaOffscreen: async () => ({ ok: true }) },
+-    });
+-    const videoJson = { body: { post: {
+-      id: "1", title: "T", feeRequired: 0, publishedDatetime: "2026-07-01T00:00:00+09:00",
+-      updatedDatetime: "2026-07-02T00:00:00+09:00", isRestricted: false,
+-      user: { userId: "9", name: "C" }, creatorId: "s", type: "file",
+-      body: { text: "", files: [
+-        { id: "v1", name: "clip", extension: "mp4", url: "https://downloads.fanbox.cc/files/post/1/v1.mp4" },
+-      ] },
+-    } } };
+-    // 過去に needs_page で止まっていた動画ジョブを仕込む(旧 URL のまま)
+-    await store.commit((l) => ({
+-      ledger: {
+-        ...l,
+-        jobs: {
+-          ...l.jobs,
+-          "1:file:v1": {
+-            idemKey: "1:file:v1", postId: "1", stableContentId: "file:v1", contentType: "video",
+-            relPath: "fanbox/s/T/old-clip.mp4", url: "https://downloads.fanbox.cc/files/post/1/old-v1.mp4",
+-            generation: 1, state: "needs_page",
+-            refetch: { postId: "1", stableContentId: "file:v1", index: 0 },
+-          } as any,
+-        },
+-      },
+-      result: null,
+-    }));
++  it("restricted は通知のみ", async () => {
++    const { deps, downloaded } = mkDeps();
+     const o = createOrchestrator(deps);
+-    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: videoJson });
+-    expect(res.queued).toBe(0);
+-    const after = (await store.read()).jobs["1:file:v1"];
+-    expect(after.state).toBe("needs_page"); // 無効化した contentType の旧ジョブを勝手に再開しない
++    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([], { isRestricted: true, body: null }) });
++    expect(downloaded).toHaveLength(0);
++    expect(res.notices.some((n) => n.includes("アクセス権"))).toBe(true);
+   });
+ 
+-
+-  it("zip 予定だが実際には zip 化に失敗して個別 DL にフォールバックする場合、changed-URL の needs_page は generation を上げて正しく回復する (codex レビュー round5 P2a フォローアップ)", async () => {
+-    // mkDeps() の既定 zip mock は eligible:()=>true / collect が失敗するため、
+-    // このブロックは「zip 予定だったが実際には個別 DL にフォールバックする」を再現する。
+-    const { deps, downloaded, store } = mkDeps();
+-    await store.commit((l) => ({
+-      ledger: {
+-        ...l,
+-        jobs: {
+-          ...l.jobs,
+-          "1:image:a": {
+-            idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+-            relPath: "fanbox/s/T/old-a.jpeg", url: "https://downloads.fanbox.cc/images/post/1/old-a.jpeg",
+-            generation: 0, state: "needs_page",
+-            refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+-          } as any,
+-        },
+-      },
+-      result: null,
+-    }));
++  it("body:null(isRestricted:false でも)は通知のみ・download ゼロ", async () => {
++    const { deps, downloaded } = mkDeps();
+     const o = createOrchestrator(deps);
+-    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a"), img("b")]) });
+-    expect(res.zipQueued).toBe(0);
+-    expect(res.queued).toBe(2); // 個別フォールバックで image:a, image:b とも enqueue
+-    const after = (await store.read()).jobs["1:image:a"];
+-    expect(after.state).toBe("requested");
+-    expect(after.relPath).toContain(".rev1."); // 世代交代の canonical パス規則が正しく効いている
+-    expect(downloaded.length).toBe(2);
++    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([], { isRestricted: false, body: null }) });
++    expect(downloaded).toHaveLength(0);
++    expect(res.notices.some((n) => n.includes("アクセス権"))).toBe(true);
+   });
+ 
+-  it("zip 予定だが実際には zip 化に失敗して個別 DL にフォールバックする場合、same-URL の needs_page は再試行されず明示 error になる (codex レビュー round5 P2a フォローアップ)", async () => {
+-    const { deps, downloaded, store } = mkDeps();
+-    const url = img("a").originalUrl; // 投稿側と同じ URL のまま(編集による失効ではない)
+-    await store.commit((l) => ({
+-      ledger: {
+-        ...l,
+-        jobs: {
+-          ...l.jobs,
+-          "1:image:a": {
+-            idemKey: "1:image:a", postId: "1", stableContentId: "image:a", contentType: "photo",
+-            relPath: "fanbox/s/T/a.jpeg", url,
+-            generation: 0, state: "needs_page",
+-            refetch: { postId: "1", stableContentId: "image:a", index: 0 },
+-          } as any,
+-        },
+-      },
+-      result: null,
+-    }));
++  it("finalUrl 再検証: (a) allowlist 外 / (b) item 無し / (b2) finalUrl 欠落 は破棄+log、(c) 正常は何もしない", async () => {
++    const { deps, removed, erased, logs, setSearch } = mkDeps();
+     const o = createOrchestrator(deps);
+-    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: postJson([img("a"), img("b")]) });
+-    const after = (await store.read()).jobs["1:image:a"];
+-    expect(after.state).toBe("error"); // 同じ URL のままの回復要求はサーバ拒否として明示 error
+-    expect(res.errors.some((e) => e.includes("同じ URL のままサーバ側の失敗が続いています"))).toBe(true);
+-    expect(downloaded).not.toContain(url); // 再試行されていない
+-    expect(downloaded).toContain(img("b").originalUrl); // image:b は通常通り enqueue される
++    await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
++    // (a) allowlist 外へリダイレクト
++    setSearch(async () => [{ id: 101, url: img("a").originalUrl, finalUrl: "https://evil.example.com/x.jpeg" } as any]);
++    await o.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
++    expect(removed).toContain(101); expect(erased).toContain(101);
++    expect(logs.some((l) => l.includes("破棄"))).toBe(true);
++
++    // (b) item 取得不能 → fail-closed
++    const d2 = mkDeps(); const o2 = createOrchestrator(d2.deps);
++    await o2.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
++    d2.setSearch(async () => []); // item 無し
++    await o2.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
++    expect(d2.removed).toContain(101); // fail-closed
++
++    // (b2) item はあるが finalUrl が無い → fail-closed(url で代用しない)
++    const d2b = mkDeps(); const o2b = createOrchestrator(d2b.deps);
++    await o2b.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
++    d2b.setSearch(async () => [{ id: 101, url: img("a").originalUrl } as any]); // finalUrl 欠落
++    await o2b.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
++    expect(d2b.removed).toContain(101);
++
++    // (c) 正常 finalUrl
++    const d3 = mkDeps(); const o3 = createOrchestrator(d3.deps);
++    await o3.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
++    d3.setSearch(async () => [{ id: 101, url: img("a").originalUrl, finalUrl: img("a").originalUrl } as any]);
++    await o3.handleDownloadChanged({ id: 101, state: { current: "complete", previous: "in_progress" } } as any);
++    expect(d3.removed).toHaveLength(0);
+   });
+ 
+-
+-  it("複数ブロックの投稿で、あるブロックの zip フォールバック回復が他ブロックの据え置き needs_page を誤って missing 化しない (codex レビュー round5 P1 フォローアップ)", async () => {
+-    const articleJson = { body: { post: {
+-      id: "1", title: "T", feeRequired: 0, publishedDatetime: "2026-07-01T00:00:00+09:00",
+-      updatedDatetime: "2026-07-02T00:00:00+09:00", isRestricted: false,
+-      user: { userId: "9", name: "C" }, creatorId: "s", type: "article",
+-      body: {
+-        blocks: [
+-          { type: "image", imageId: "i1" },
+-          { type: "image", imageId: "i2" },
+-          { type: "file", fileId: "f1" },
+-          { type: "image", imageId: "i4" },
+-          { type: "image", imageId: "i5" },
+-        ],
+-        imageMap: {
+-          i1: { id: "i1", extension: "jpeg", originalUrl: "https://downloads.fanbox.cc/images/post/1/i1.jpeg" },
+-          i2: { id: "i2", extension: "jpeg", originalUrl: "https://downloads.fanbox.cc/images/post/1/i2.jpeg" },
+-          i4: { id: "i4", extension: "jpeg", originalUrl: "https://downloads.fanbox.cc/images/post/1/i4.jpeg" },
+-          i5: { id: "i5", extension: "jpeg", originalUrl: "https://downloads.fanbox.cc/images/post/1/i5.jpeg" },
+-        },
+-        fileMap: {
+-          f1: { id: "f1", name: "doc", extension: "pdf", url: "https://downloads.fanbox.cc/files/post/1/f1.pdf" },
+-        },
+-        embedMap: {}, urlEmbedMap: {},
+-      },
+-    } } };
+-    // block1(i1,i2)は zip 成功、block3(i4,i5)は zip 失敗してフォールバックする状況を再現する
+-    const { deps, store } = mkDeps({
+-      zip: {
+-        eligible: (b: any) => b.contentType === "photo" && b.files.length >= 2,
+-        collect: async (files: any) => {
+-          if (files.some((f: any) => f.idemKey.includes("image:i1") || f.idemKey.includes("image:i2"))) {
+-            return { ok: true, buffers: new Map(files.map((f: any) => [f.idemKey, new Uint8Array(1)])) };
+-          }
+-          return { ok: false, error: "zip 失敗(テスト・block3)" };
+-        },
+-        build: (post: any, b: any) => ({ zipPath: `fanbox/s/T/block${b.blockOrdinal}.zip`, bytes: new Uint8Array(1) }),
+-        downloadViaOffscreen: async () => ({ ok: true }),
+-      },
+-    });
+-    await store.commit((l) => ({
+-      ledger: {
+-        ...l,
+-        jobs: {
+-          ...l.jobs,
+-          "1:image:i1": {
+-            idemKey: "1:image:i1", postId: "1", stableContentId: "image:i1", contentType: "photo",
+-            relPath: "fanbox/s/T/old-i1.jpeg", url: "https://downloads.fanbox.cc/images/post/1/old-i1.jpeg",
+-            generation: 0, state: "needs_page",
+-            refetch: { postId: "1", stableContentId: "image:i1", index: 0 },
+-          } as any,
+-          "1:image:i4": {
+-            idemKey: "1:image:i4", postId: "1", stableContentId: "image:i4", contentType: "photo",
+-            relPath: "fanbox/s/T/old-i4.jpeg", url: "https://downloads.fanbox.cc/images/post/1/old-i4.jpeg",
+-            generation: 0, state: "needs_page",
+-            refetch: { postId: "1", stableContentId: "image:i4", index: 0 },
+-          } as any,
+-        },
+-      },
+-      result: null,
+-    }));
++  it("redirect map は complete/interrupted で除去される(未知 downloadId は無視)", async () => {
++    const { deps, removed, setSearch } = mkDeps();
+     const o = createOrchestrator(deps);
+-    const res = await o.handleDownloadRequest({ kind: "download", postId: "1", force: false, json: articleJson });
+-    const jobs = (await store.read()).jobs;
+-    // block1(i1,i2)は zip 成功 -> i1 の据え置き needs_page は他ブロック処理の巻き添えで
+-    // missing/error 化されず、needs_page のまま残る
+-    expect(jobs["1:image:i1"].state).toBe("needs_page");
+-    // block3(i4,i5)は zip 失敗 -> フォールバックで i4 は正しく世代交代して回復する
+-    expect(jobs["1:image:i4"].state).toBe("requested");
+-    expect(jobs["1:image:i4"].relPath).toContain(".rev1.");
+-    expect(res.zipQueued).toBe(1); // block1 のみ zip 成功
++    await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
++    // 未知の downloadId は無視される(自分の通常 DL ではない)
++    await o.handleDownloadChanged({ id: 9999, state: { current: "complete", previous: "in_progress" } } as any);
++    expect(removed).toHaveLength(0);
++    // interrupted は再検証せず単に map から除去される
++    setSearch(async () => { throw new Error("should not be called"); });
++    await expect(o.handleDownloadChanged({ id: 101, state: { current: "interrupted", previous: "in_progress" } } as any)).resolves.toBeUndefined();
+   });
+ });

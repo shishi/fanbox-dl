@@ -27,3 +27,6 @@ Final review rounds 5-6: P2 tail(blocker 無し・P1/Critical は rounds 1-4 で
   - P2b template-engine.ts fmtDate が local-time getter → $date のタイムゾーン差でマシン間 relPath/dedup ズレ。**unmodified core(fantia-dl 由来)・core 無改造制約と衝突・shishi 判断**
 Task 5(subagent 実装): 全16タスク完了・194 tests・build 4-entry。手動 E2E ゲート待ち。P2 tail は post-MVP backlog(P2a fire-and-forget / P2b $date TZ core)
 === 変更フェーズ開始(履歴撤去+ボタン)base f67156f ===
+chg Task 1: complete (commit 86ac122, 112 tests, SPEC ✅ Approved, core 無変更・dangling 0)
+chg Task 2: complete (commit 96efe83, 116 tests, 🔄 撤去・preventDefault/stopPropagation・dom-helpers 単体テスト済み, DOM 配線は手動ゲート)
+chg Task 3: complete (commit 944f509, 116 tests, clearHistory/overwrite grep 0, build 4-entry, controller-inspected)
