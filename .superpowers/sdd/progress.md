@@ -30,3 +30,9 @@ Task 5(subagent 実装): 全16タスク完了・194 tests・build 4-entry。手�
 chg Task 1: complete (commit 86ac122, 112 tests, SPEC ✅ Approved, core 無変更・dangling 0)
 chg Task 2: complete (commit 96efe83, 116 tests, 🔄 撤去・preventDefault/stopPropagation・dom-helpers 単体テスト済み, DOM 配線は手動ゲート)
 chg Task 3: complete (commit 944f509, 116 tests, clearHistory/overwrite grep 0, build 4-entry, controller-inspected)
+chg Task 3: complete (commit 944f509, options/README, build 4-entry, grep 0)
+変更 最終レビュー: codex native 7 巡。Critical/P1 は rounds 1-4 で全解決。rounds 5-7 は redirect-map ライフサイクル + 一覧ボタン DOM 再利用の 2 領域で P2 が振動(膠着)したため automated 反復を停止(skill 準拠)。
+  受容 residual(post-MVP backlog / 手動ゲートで実在確認):
+  - redirect-map: terminal interrupted(SERVER_FORBIDDEN/disk-full/cancel)で mapping が browser 終了まで残存 + 失敗が silent(fire-and-forget の性質上、通常 DL の完了/失敗は追跡しない設計。finalUrl 検証は complete のみ)
+  - 一覧ボタン: FANBOX が card host を非投稿へ再利用/anchor 一時差し替えした場合、古い data-fbxdl-for ボタンが残り得る(実 DOM での再利用挙動は未検証。手動ゲートで確認)
+  現状 HEAD 0ce31f6: 142 tests green / typecheck 0 / build 4-entry / core 無変更
