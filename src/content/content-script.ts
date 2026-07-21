@@ -1,5 +1,5 @@
 import { fetchPostInfo } from "../fanbox/api";
-import { postIdFromPathname, postIdFromHref, isCreatorPostListPage, selectPostAnchorIndicesToInject, isPostDateRowText, isPostTitleHeadingText } from "./dom-helpers";
+import { postIdFromPathname, postIdFromHref, isCreatorPostListPage, selectPostAnchorIndicesToInject, isPostDateRowText, isPostTitleHeadingText, shouldHandleDlClick } from "./dom-helpers";
 import type { DownloadRequestMessage, DownloadResponse } from "./messages";
 
 // 指定 postId の投稿を DL(content script が isolated world で post.info を fetch → SW へ)。
@@ -43,6 +43,9 @@ function makeDlButton(label: string, small: boolean, onClick: () => Promise<Down
   b.type = "button"; b.textContent = label; b.title = "この投稿をダウンロード";
   styleBtn(b, small);
   b.addEventListener("click", (ev) => {
+    // 信頼クリックゲート: 合成クリックで拡張の権限を無断駆動させない
+    // (判定の意図と経緯は shouldHandleDlClick 定義側のコメント参照)。
+    if (!shouldHandleDlClick(ev)) return;
     ev.preventDefault(); ev.stopPropagation();
     b.disabled = true;
     onClick().then((r) => { if (r) swapText(b, `⬇ ${r.queued + r.zipQueued} 件開始`); else b.disabled = false; })

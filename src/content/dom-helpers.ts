@@ -120,3 +120,13 @@ export function selectPostAnchorIndicesToInject(postIds: (string | null)[], alre
   }
   return Array.from(lastIndexForId.values()).sort((a, b) => a - b);
 }
+
+// 信頼クリックゲート: DL ボタンの click ハンドラは、実ユーザー操作
+// (event.isTrusted === true)の場合のみ実行する。ページ上のスクリプト
+// (第一者・侵害済みを問わず)が button.click() や dispatchEvent で click を
+// 合成すると、拡張の権限(cookie 付き post.info fetch + chrome.downloads)を
+// 無断駆動でき、dedup 無しの fire-and-forget 設計では無制限の重複 DL に
+// 直結するため、この経路を封じる(fantia-dl 2026-07-21 spec round18 と同種)。
+export function shouldHandleDlClick(ev: { isTrusted: boolean }): boolean {
+  return ev.isTrusted;
+}

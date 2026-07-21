@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { postIdFromPathname, postIdFromHref, isCreatorPostListPage, selectPostAnchorIndicesToInject, isPostDateRowText, isPostTitleHeadingText } from "../src/content/dom-helpers";
+import { postIdFromPathname, postIdFromHref, isCreatorPostListPage, selectPostAnchorIndicesToInject, isPostDateRowText, isPostTitleHeadingText, shouldHandleDlClick } from "../src/content/dom-helpers";
 
 describe("isPostTitleHeadingText(codex-review round3 P2: 日付行判別だけではクリエイターヘッダー h1 の隣の年+時刻テキストに誤爆し得るため、document.title の前方一致で投稿タイトル h1 を構造的に特定する)", () => {
   const docTitle = "メイちゃんのえちち動画(short_ver)｜POPYPOPY｜pixivFANBOX";
@@ -170,5 +170,14 @@ describe("selectPostAnchorIndicesToInject(最終レビュー3巡目 P3: 1 カー
     const postIds = ["1"]; // 旧 anchor(とそのボタン)は既に DOM から消えている
     const picked = selectPostAnchorIndicesToInject(postIds, new Set()); // 呼び出し側が実在ボタン 0 件と数えた
     expect(picked).toEqual([0]);
+  });
+});
+
+describe("shouldHandleDlClick(信頼クリックゲート: ページスクリプトが button.click() を合成すると、拡張の権限(cookie 付き post.info fetch + chrome.downloads)を無断駆動でき、dedup 無しの fire-and-forget 設計では無制限の重複 DL に直結する)", () => {
+  it("実ユーザー操作のクリック(isTrusted: true)は処理する", () => {
+    expect(shouldHandleDlClick({ isTrusted: true })).toBe(true);
+  });
+  it("スクリプトが合成したクリック(isTrusted: false。dispatchEvent / element.click() いずれも)は無視する", () => {
+    expect(shouldHandleDlClick({ isTrusted: false })).toBe(false);
   });
 });
