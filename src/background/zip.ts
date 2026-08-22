@@ -5,6 +5,7 @@ import { validateMediaUrl } from "../core/url-allowlist";
 import { CONFLICT_ACTION } from "../core/settings";
 import { validatePath } from "../core/path-validator";
 import { buildRenderContext, buildZipRenderContext } from "./render-adapter";
+import { filenameGuard } from "./filename-guard";
 import { OFFSCREEN_TARGET } from "../offscreen/protocol";
 import type { OffscreenAbortMessage, OffscreenChunkMessage, OffscreenDoneMessage, OffscreenRevokeMessage, OffscreenResult } from "../offscreen/protocol";
 import type { ContentBlock, PostData, Settings } from "../core/types";
@@ -194,7 +195,11 @@ async function finishZipDownload(jobId: string, filename: string): Promise<ZipPo
 
   const blobUrl = res.url;
   try {
-    const downloadId = await chrome.downloads.download({ url: blobUrl, filename, saveAs: false, conflictAction: CONFLICT_ACTION });
+    // 通常 DL と同じく、blob DL も onDeterminingFilename の横取り対象になる
+    // (登録済みの他拡張が居ると zipPathTemplate の結果が捨てられる)。
+    // 発行口を filenameGuard に通してテンプレ名を再主張できるようにする。
+    const downloadId = await filenameGuard.claimAndDownload(blobUrl, filename, () =>
+      chrome.downloads.download({ url: blobUrl, filename, saveAs: false, conflictAction: CONFLICT_ACTION }));
     zipDownloads.set(downloadId, blobUrl);
     await persistZipDownloads();
     return { queued: 1 };

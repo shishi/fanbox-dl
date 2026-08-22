@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { createOrchestrator, safeReplacement, type OrchestratorDeps } from "../src/background/orchestrator";
+import { createFilenameGuard } from "../src/background/filename-guard";
 import { DEFAULT_SETTINGS } from "../src/core/settings";
 
 const img = (id: string, postId = "1") => ({ id, extension: "jpeg", width: 1, height: 1, originalUrl: `https://downloads.fanbox.cc/images/post/${postId}/${id}.jpeg`, thumbnailUrl: `https://downloads.fanbox.cc/images/post/${postId}/t${id}.jpeg` });
@@ -11,7 +12,11 @@ function mkDeps(over: Partial<OrchestratorDeps> = {}) {
   const mem: Record<string, unknown> = {};
   let nextId = 100;
   let searchImpl: (q: any) => Promise<any[]> = async () => [];
+  // guard もテストごとに作り直す(モジュール共有シングルトンを触ると claim が
+  // テスト間で持ち越され、実行順に依存する)。
+  const filenameGuard = createFilenameGuard();
   const deps: OrchestratorDeps = {
+    filenameGuard,
     downloads: {
       download: async (o) => { downloaded.push({ url: o.url!, filename: o.filename!, conflictAction: o.conflictAction }); return ++nextId; },
       search: (q) => searchImpl(q),
@@ -26,7 +31,7 @@ function mkDeps(over: Partial<OrchestratorDeps> = {}) {
     log: (m) => logs.push(m),
     ...over,
   };
-  return { deps, downloaded, erased, removed, canceled, logs, mem, setSearch: (f: typeof searchImpl) => { searchImpl = f; } };
+  return { deps, downloaded, erased, removed, canceled, logs, mem, filenameGuard, setSearch: (f: typeof searchImpl) => { searchImpl = f; } };
 }
 
 describe("orchestrator fire-and-forget", () => {
@@ -37,6 +42,22 @@ describe("orchestrator fire-and-forget", () => {
     expect(res.queued).toBe(2);
     expect(downloaded).toHaveLength(2);
     expect(downloaded.every((d) => d.conflictAction === "uniquify")).toBe(true);
+  });
+
+  it("横取り対策: download する URL のテンプレ名を onDeterminingFilename 用に claim する", async () => {
+    // 他拡張が downloads.onDeterminingFilename を握っていると download({filename})
+    // の提案が捨てられるため、こちらも同イベントで再主張できるよう、download を
+    // 呼ぶ前にその URL のテンプレ名を claim しておく必要がある。
+    const { deps, downloaded, filenameGuard } = mkDeps();
+    const o = createOrchestrator(deps);
+    await o.handleDownloadRequest({ kind: "download", postId: "1", json: postJson([img("a")]) });
+    const calls: Array<{ filename: string }> = [];
+    const handled = filenameGuard.handleDeterminingFilename(
+      { url: img("a").originalUrl },
+      (s) => calls.push(s),
+    );
+    expect(handled).toBe(true);
+    expect(calls[0].filename).toBe(downloaded[0].filename);
   });
 
   it("zip フォールバックは 2 フレーズの notice + 個別 DL", async () => {

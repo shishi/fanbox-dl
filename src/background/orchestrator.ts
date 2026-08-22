@@ -5,6 +5,7 @@ import { validatePath } from "../core/path-validator";
 import { validateMediaUrl } from "../core/url-allowlist";
 import { CONFLICT_ACTION } from "../core/settings";
 import { buildRenderContext } from "./render-adapter";
+import type { FilenameGuard } from "./filename-guard";
 import { zipEligible, collectZipSources, buildZip, downloadZipViaOffscreen, ZIP_FALLBACK_WORDING, ZIP_RETRY_WORDING } from "./zip";
 import type { DownloadRequestMessage, DownloadResponse } from "../content/messages";
 import type { Settings } from "../core/types";
@@ -31,6 +32,8 @@ export interface OrchestratorDeps {
     cancel(id: number): Promise<void>;
   };
   loadSettings: () => Promise<Settings>;
+  // downloads.onDeterminingFilename の横取り対策。download の発行はここを通す。
+  filenameGuard: FilenameGuard;
   zip: {
     eligible: typeof zipEligible;
     collect: typeof collectZipSources;
@@ -107,7 +110,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     // spec §4a: download 直前に allowlist 再検証(最後の砦)。
     const v = validateMediaUrl(url, postId);
     if (!v.ok) throw new Error(`allowlist 違反: ${v.error}`);
-    const id = await deps.downloads.download({ url, filename, saveAs: false, conflictAction: CONFLICT_ACTION });
+    // 横取り対策: download({filename}) の filename は「提案」でしかなく、
+    // downloads.onDeterminingFilename を登録した拡張がブラウザに居ると捨てられて
+    // 生ファイル名で保存される。同イベントで名前を言い直せるよう、発行前にこの URL の
+    // テンプレ名を claim する(claimAndDownload が claim と失敗時の取り消しを行う。
+    // 効き方の前提は filename-guard.ts の冒頭コメントを見ること)。
+    const id = await deps.filenameGuard.claimAndDownload(url, filename, () =>
+      deps.downloads.download({ url, filename, saveAs: false, conflictAction: CONFLICT_ACTION }));
     redirect.set(id, postId);
     // 最終レビュー3巡目 P2: persist(session.set)が失敗すると、DL 自体は継続するが
     // downloadId→postId の対応が in-memory にしか無くなる。SW 再起動でこの対応が
