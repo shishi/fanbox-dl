@@ -34,18 +34,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return false;
 });
 
-// 横取り対策: download({filename}) の filename は提案でしかなく、
-// downloads.onDeterminingFilename を登録した拡張が居ると捨てられる。ここで
-// 自分の DL のテンプレ名を言い直す(効き方の前提と、効かないときに疑う先は
-// filename-guard.ts の冒頭コメントに書いてある)。
-// MV3 なのでトップレベルで同期的に登録する(遅延登録だと SW が寝ている間の
-// イベントでこの SW が起こされず、他拡張の決定がそのまま通る)。
-// suggest() を呼ぶのは claim 済み URL = 自分が発行した DL だけ。それ以外は
-// 何も返さず他拡張の決定に干渉しない(戻り値 true は「suggest を非同期で呼ぶ」
-// の意味なので、同期 suggest のここでは返さない)。
-chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
-  filenameGuard.handleDeterminingFilename(item, suggest);
-});
+// 横取り対策: event への接続先だけをトップレベルで渡す。実 listener は
+// claimAndDownload が claim を積んだ直後に登録され、最後の claim を suggest したら
+// 解除される。永続登録すると、何も claim していない姉妹拡張まで全 DL のファイル名
+// 決定へ参加し、Chromium が自動補完する空 suggest() と所有側の suggest が競合する。
+filenameGuard.bindDeterminingFilenameEvent(chrome.downloads.onDeterminingFilename);
 
 chrome.downloads.onChanged.addListener(async (delta) => {
   if (await handleZipDownloadChange(delta)) return; // zip 由来

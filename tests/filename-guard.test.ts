@@ -6,6 +6,28 @@ function mkSuggest() {
   return { calls, suggest: (o: any) => { calls.push(o); } };
 }
 
+function mkDeterminingFilenameEvent() {
+  type Listener = (
+    item: { url?: string },
+    suggest: (o: { filename: string; conflictAction: string }) => void,
+  ) => void;
+  const listeners = new Set<Listener>();
+  return {
+    event: {
+      addListener: (listener: Listener) => { listeners.add(listener); },
+      removeListener: (listener: Listener) => { listeners.delete(listener); },
+    },
+    listenerCount: () => listeners.size,
+    dispatch(item: { url?: string }) {
+      const suggestions: Array<{ filename: string; conflictAction: string }> = [];
+      for (const listener of [...listeners]) {
+        listener(item, (suggestion) => { suggestions.push(suggestion); });
+      }
+      return suggestions;
+    },
+  };
+}
+
 const U = "https://downloads.fanbox.cc/images/post/1/a.jpeg";
 
 describe("filename guard (downloads.onDeterminingFilename の横取り対策)", () => {
@@ -78,5 +100,22 @@ describe("filename guard (downloads.onDeterminingFilename の横取り対策)", 
     const { calls, suggest } = mkSuggest();
     expect(g.handleDeterminingFilename({ url: normalized }, suggest)).toBe(true);
     expect(calls[0].filename).toBe("20260115 T  日本語.zip");
+  });
+
+  it("姉妹拡張との競合回避: claim がある guard だけ listener を登録し、消費後は解除する", async () => {
+    const event = mkDeterminingFilenameEvent();
+    const owner = createFilenameGuard();
+    const sibling = createFilenameGuard();
+    owner.bindDeterminingFilenameEvent(event.event);
+    sibling.bindDeterminingFilenameEvent(event.event);
+
+    expect(event.listenerCount()).toBe(0);
+    await owner.claimAndDownload(U, "owner.jpeg", async () => 1);
+    expect(event.listenerCount()).toBe(1);
+
+    expect(event.dispatch({ url: U })).toEqual([
+      { filename: "owner.jpeg", conflictAction: "uniquify" },
+    ]);
+    expect(event.listenerCount()).toBe(0);
   });
 });
