@@ -165,7 +165,7 @@ context の組み立て(background)で以下のようにマッピングする。
 | `$postTitle` / `$postId` | `post.title` / `post.id` |
 | `$date{fmt}` | `post.publishedDatetime` |
 | `$today{fmt}` | 実行日(変更なし) |
-| `$contentTitle` | **常に null**(Fanbox にコンテンツブロック題名が無い。`[...]` で自然に消える) |
+| `$contentTitle` | **常に空文字列**(Fanbox にコンテンツブロック題名が無い。`[...]` で自然に消える) |
 | `$contentId` | **ContentBlock の post 内通し番号("1", "2", …)**。fantia-dl の block-id 相当で、通常 DL・zip の両テンプレ文脈で同じ値(テンプレ用の値であり、識別子ではない。identity は §6 の `stableContentId` = `image:{id}` / `file:{id}` が担い、テンプレには出さない) |
 | `$contentType` | photo / file / video(§6 のマッピング) |
 | `$plan` | **`String(post.feeRequired)`**(例 "0", "500"。Fanbox の post.info にプラン名が無いため金額で代替) |
@@ -173,8 +173,11 @@ context の組み立て(background)で以下のようにマッピングする。
 | `$ext` | item の `extension`(URL 末尾と一致することを parse 層で検証しない。`extension` を正とする) |
 | `$seq` / `$seq{n}` / `$total` | コンテンツブロック内の連番(fantia-dl と同一ルール §5) |
 
-デフォルトテンプレート例:
-`fanbox/$creatorId/$date{YYYYMMDD}_$postTitle/[$seq{3}_]$filename.$ext`
+既定の命名テンプレートは、①通常保存、② zip ファイル、③ zip 内エントリの順に次のとおり。
+
+- ① `$creator/$date{YYYYMMDD} $postTitle $contentTitle $filename[ $seq{1}].$ext`
+- ② `$creator/$date{YYYYMMDD} $postTitle $contentTitle.$ext`
+- ③ `$date{YYYYMMDD} $postTitle $contentTitle $seq{1}.$ext`
 
 ## 6. parse 層(src/fanbox/parse.ts)
 
@@ -274,13 +277,11 @@ ContentBlock のみをブロック単位で 1 つの zip にまとめる(fantia-
 切り替えました」という**非致命の通知**を出す。ファイルが黙って欠落する終端状態を
 作らない(後述 §7b 内の「明示エラー」記述はこのフォールバック+通知を指す)。
 
-**zip 名の導出**: fantia-dl の既定 `$contentTitle.zip` は Fanbox では成立しない
-($contentTitle は常に null、§5)。`$contentId`(ブロック通し番号、§5)を使い、
-zipPathTemplate の既定を
-`fanbox/$creatorId/$date{YYYYMMDD}_$postTitle/images_$contentId.zip` とする
-(複数グループでも決定的に命名が分かれる)。zip 内エントリの既定は fantia-dl と同一
-(`[$seq{3}_]$filename.$ext`)。テンプレエンジン(core)のプレースホルダ集合は
-無改造(`$contentId` の値がブロック通し番号になるのは context 組み立て側の責務)。
+**zip 名の導出**: zipPathTemplate と zipEntryTemplate の既定は §5 の②③を使う。
+zipPathTemplate の `$ext` は `zip` に解決する。Fanbox にはコンテンツブロック名がないため、
+`$contentTitle` は空文字列に解決する。複数ブロックの zip 名が同じになった場合は、
+`downloads.download` の `conflictAction: "uniquify"` で別名保存する。
+`$contentId` は引き続き利用でき、ブロック別の名前が必要ならテンプレートに指定できる。
 
 fantia-dl の zip 経路は MAIN-world page script が対象 URL を fetch してバイト列を得るが、
 Fanbox では `downloads.fanbox.cc` が CORS 全拒否のため**この経路は成立しない**(§4 実測)。

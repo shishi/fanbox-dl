@@ -25,8 +25,9 @@ describe("mergeSettings (fanbox)", () => {
   it("CONFLICT_ACTION 定数は uniquify", () => {
     expect(CONFLICT_ACTION).toBe("uniquify");
   });
-  it("既定テンプレートが fanbox 用", () => {
-    expect(DEFAULT_SETTINGS.pathTemplate).toBe("fanbox/$creatorId/$date{YYYYMMDD}_$postTitle/[$seq{3}_]$filename.$ext");
-    expect(DEFAULT_SETTINGS.zipPathTemplate).toBe("fanbox/$creatorId/$date{YYYYMMDD}_$postTitle/images_$contentId.zip");
+  it("指定の既定テンプレートを使う", () => {
+    expect(DEFAULT_SETTINGS.pathTemplate).toBe("$creator/$date{YYYYMMDD} $postTitle $contentTitle $filename[ $seq{1}].$ext");
+    expect(DEFAULT_SETTINGS.zipPathTemplate).toBe("$creator/$date{YYYYMMDD} $postTitle $contentTitle.$ext");
+    expect(DEFAULT_SETTINGS.zipEntryTemplate).toBe("$date{YYYYMMDD} $postTitle $contentTitle $seq{1}.$ext");
   });
 });

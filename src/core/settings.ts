@@ -5,15 +5,15 @@ import type { Settings } from "./types";
 export const CONFLICT_ACTION = "uniquify" as const;
 
 export const DEFAULT_SETTINGS: Settings = {
-  pathTemplate: "fanbox/$creatorId/$date{YYYYMMDD}_$postTitle/[$seq{3}_]$filename.$ext",
+  pathTemplate: "$creator/$date{YYYYMMDD} $postTitle $contentTitle $filename[ $seq{1}].$ext",
   illegalCharReplacement: "_",
   contentTypes: { photo: true, file: true, video: true },
   segmentMaxLen: 200,
   fullPathMaxLen: 180,
   uniquifyHeadroom: 16,
   zipGalleries: true,
-  zipPathTemplate: "fanbox/$creatorId/$date{YYYYMMDD}_$postTitle/images_$contentId.zip",
-  zipEntryTemplate: "[$seq{3}_]$filename.$ext",
+  zipPathTemplate: "$creator/$date{YYYYMMDD} $postTitle $contentTitle.$ext",
+  zipEntryTemplate: "$date{YYYYMMDD} $postTitle $contentTitle $seq{1}.$ext",
 };
 
 // 既知キーだけを拾う(旧 conflictAction や未知キーを持ち込まない migration 規則。spec §14)。
