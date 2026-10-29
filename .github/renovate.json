@@ -16,7 +16,7 @@
     "automerge": true,
     "automergeType": "pr",
     "minimumReleaseAge": "0 days",
-    "platformAutomerge": false,
+    "platformAutomerge": true,
     "enabled": true,
     "schedule": [
       "before 6am on monday"
